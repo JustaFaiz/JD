@@ -1,276 +1,132 @@
 """
-Tax Data Inventory Crawler
----------------------------
-Walks a folder of tax workpapers (.xlsx/.xlsm), extracts structural
-metadata from each file, and writes it into a multi-tab Excel workbook
-that seeds the Tax Data Inventory / Metadata Repository.
-
-It does NOT read or move business data (cell values, dollar amounts,
-taxpayer figures) — only structure: sheet names, headers, named ranges,
-external links, comments, and formulas that reference other files.
+Tax Data Inventory Dashboard
+-----------------------------
+Small Streamlit UI on top of tax_metadata_crawler.py. Lets you pick
+which workpaper file(s) to scan (instead of pointing the script at a
+whole folder), preview the results, and download the inventory workbook.
 
 USAGE:
-    python tax_metadata_crawler.py <input_folder> <output_file.xlsx>
+    streamlit run tax_inventory_dashboard.py
 
-Example:
-    python tax_metadata_crawler.py "C:\\Tax\\Workpapers" "Tax_Data_Inventory_Draft.xlsx"
+Requires: streamlit, openpyxl, pandas
+    pip install streamlit
 
-Requires: openpyxl, pandas  (both already in your environment)
+IMPORTANT: this file must sit in the same folder as tax_metadata_crawler.py
 """
 
+import io
 import os
-import re
-import sys
-from datetime import datetime
+import tempfile
 
 import pandas as pd
-from openpyxl import load_workbook
+import streamlit as st
 
-# Keyword hints used to guess which upstream/downstream system a file
-# belongs to, based on filename. Edit this dict to match your naming
-# conventions — it's a starting guess, not a source of truth.
-SYSTEM_KEYWORDS = {
-    "SAP": ["sap", "fico", "trial balance", "tb_"],
-    "Longview": ["longview", "lv_"],
-    "Corptax": ["corptax", "ctx_"],
-    "Excel Workpaper": [],  # fallback bucket, always matches last
-}
+from tax_metadata_crawler import crawl_files, write_inventory, SYSTEM_KEYWORDS
 
-EXTERNAL_REF_PATTERN = re.compile(r"\[\d+\]")  # e.g. ='[1]Sheet1'!$A$1
+st.set_page_config(page_title="Tax Data Inventory Crawler", layout="wide")
 
+st.title("Tax Data Inventory Crawler")
+st.caption(
+    "Upload the specific workpaper(s) you've confirmed are in scope. "
+    "The scan reads structure only (sheet names, headers, named ranges, "
+    "comments, cross-file formula links) — never cell values."
+)
 
-def guess_system(filename: str) -> str:
-    name_lower = filename.lower()
+# ---- File selection -------------------------------------------------
+uploaded_files = st.file_uploader(
+    "Select workpaper file(s) to scan",
+    type=["xlsx", "xlsm"],
+    accept_multiple_files=True,
+)
+
+with st.expander("System-guess keywords (optional — edit to match your file naming)"):
+    st.write(
+        "The scanner tags each file with a guessed source system based on "
+        "keywords in the filename. Adjust below if your naming differs."
+    )
+    edited_keywords = {}
     for system, keywords in SYSTEM_KEYWORDS.items():
-        for kw in keywords:
-            if kw in name_lower:
-                return system
-    return "Unclassified"
+        default_val = ", ".join(keywords)
+        user_val = st.text_input(f"{system} keywords", value=default_val)
+        edited_keywords[system] = [k.strip().lower() for k in user_val.split(",") if k.strip()]
 
+run_scan = st.button("Run Inventory Scan", type="primary", disabled=not uploaded_files)
 
-def find_header_row(ws, max_scan_rows=10, max_scan_cols=40):
-    """
-    Heuristic: the header row is the first row within the first
-    max_scan_rows that has more than 2 non-empty text cells in a row.
-    Returns (row_index, [header_values]) or (None, []) if not found.
-    """
-    for row_idx in range(1, max_scan_rows + 1):
-        row_values = []
-        non_empty = 0
-        for col_idx in range(1, max_scan_cols + 1):
-            cell = ws.cell(row=row_idx, column=col_idx)
-            val = cell.value
-            row_values.append(val)
-            if val not in (None, ""):
-                non_empty += 1
-        if non_empty > 2:
-            return row_idx, row_values
-    return None, []
+# ---- Run scan ---------------------------------------------------------
+if run_scan and uploaded_files:
+    # Apply any keyword edits from the sidebar back into the shared module
+    SYSTEM_KEYWORDS.clear()
+    SYSTEM_KEYWORDS.update(edited_keywords)
 
+    with tempfile.TemporaryDirectory() as tmpdir:
+        saved_paths = []
+        for uploaded in uploaded_files:
+            path = os.path.join(tmpdir, uploaded.name)
+            with open(path, "wb") as f:
+                f.write(uploaded.getbuffer())
+            saved_paths.append(path)
 
-def extract_comments(ws, sheet_name, file_name):
-    records = []
-    for row in ws.iter_rows():
-        for cell in row:
-            if cell.comment is not None:
-                records.append({
-                    "File": file_name,
-                    "Sheet": sheet_name,
-                    "Cell": cell.coordinate,
-                    "Author": cell.comment.author,
-                    "Comment": cell.comment.text.strip(),
-                })
-    return records
+        progress_bar = st.progress(0.0, text="Starting scan...")
+        status_text = st.empty()
 
+        scanned = {"count": 0}
 
-def extract_external_links(ws, sheet_name, file_name):
-    """Flags formulas that reference another workbook, e.g. ='[1]Sheet1'!$B$2"""
-    records = []
-    for row in ws.iter_rows():
-        for cell in row:
-            if isinstance(cell.value, str) and cell.value.startswith("="):
-                if EXTERNAL_REF_PATTERN.search(cell.value):
-                    records.append({
-                        "File": file_name,
-                        "Sheet": sheet_name,
-                        "Cell": cell.coordinate,
-                        "Formula": cell.value,
-                    })
-    return records
+        def report_progress(fname):
+            scanned["count"] += 1
+            pct = scanned["count"] / len(saved_paths)
+            progress_bar.progress(pct, text=f"Scanning: {fname}")
 
+        dataframes = crawl_files(saved_paths, progress_callback=report_progress)
+        progress_bar.progress(1.0, text="Scan complete")
+        status_text.success(f"Scanned {len(saved_paths)} file(s).")
 
-def extract_named_ranges(wb, file_name):
-    records = []
-    for name, defined_name in wb.defined_names.items():
-        records.append({
-            "File": file_name,
-            "Name": name,
-            "RefersTo": defined_name.attr_text,
-        })
-    return records
+        # Persist results in session_state so the download button
+        # (which triggers a rerun) doesn't lose the scan.
+        st.session_state["dataframes"] = dataframes
 
+        # Also build the downloadable workbook in memory now
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp_out:
+            out_path = tmp_out.name
+        write_inventory(dataframes, out_path)
+        with open(out_path, "rb") as f:
+            st.session_state["output_bytes"] = f.read()
+        os.remove(out_path)
 
-def crawl_file(filepath):
-    """
-    Returns a dict of lists: headers, named_ranges, external_links, comments, errors
-    for a single workbook.
-    """
-    file_name = os.path.basename(filepath)
-    result = {
-        "headers": [],
-        "named_ranges": [],
-        "external_links": [],
-        "comments": [],
-        "errors": [],
-    }
+# ---- Display results ----------------------------------------------
+if "dataframes" in st.session_state:
+    dfs = st.session_state["dataframes"]
 
-    try:
-        # keep_links=True preserves external link info; data_only=False
-        # so we see formulas (needed to detect cross-file references).
-        wb = load_workbook(filepath, data_only=False, keep_links=True)
-    except Exception as e:
-        result["errors"].append({
-            "File": file_name,
-            "Issue": f"Could not open file: {e}",
-        })
-        return result
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Fields discovered", len(dfs["headers"]))
+    col2.metric("Named ranges", len(dfs["named_ranges"]))
+    col3.metric("Cross-file links", len(dfs["external_links"]))
+    col4.metric(
+        "Files with errors",
+        dfs["errors"]["File"].nunique() if not dfs["errors"].empty else 0,
+    )
 
-    system_guess = guess_system(file_name)
+    st.download_button(
+        label="Download Tax Data Inventory (.xlsx)",
+        data=st.session_state["output_bytes"],
+        file_name="Tax_Data_Inventory_Draft.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-
-        try:
-            header_row, header_values = find_header_row(ws)
-            if header_row:
-                for col_idx, val in enumerate(header_values, start=1):
-                    if val not in (None, ""):
-                        result["headers"].append({
-                            "System (guess)": system_guess,
-                            "File": file_name,
-                            "Sheet": sheet_name,
-                            "Header Row": header_row,
-                            "Column": ws.cell(row=header_row, column=col_idx).coordinate,
-                            "Field Name": str(val).strip(),
-                            "Owner": "",       # left blank for manual fill-in
-                            "Downstream Use": "",  # left blank for manual fill-in
-                        })
-            else:
-                result["errors"].append({
-                    "File": file_name,
-                    "Issue": f"No clear header row found on sheet '{sheet_name}'",
-                })
-        except Exception as e:
-            result["errors"].append({
-                "File": file_name,
-                "Issue": f"Header scan failed on sheet '{sheet_name}': {e}",
-            })
-
-        try:
-            result["comments"].extend(extract_comments(ws, sheet_name, file_name))
-        except Exception as e:
-            result["errors"].append({
-                "File": file_name,
-                "Issue": f"Comment scan failed on sheet '{sheet_name}': {e}",
-            })
-
-        try:
-            result["external_links"].extend(extract_external_links(ws, sheet_name, file_name))
-        except Exception as e:
-            result["errors"].append({
-                "File": file_name,
-                "Issue": f"External link scan failed on sheet '{sheet_name}': {e}",
-            })
-
-    try:
-        result["named_ranges"].extend(extract_named_ranges(wb, file_name))
-    except Exception as e:
-        result["errors"].append({
-            "File": file_name,
-            "Issue": f"Named range scan failed: {e}",
-        })
-
-    return result
-
-
-def crawl_folder(input_folder):
-    all_headers, all_named_ranges = [], []
-    all_external_links, all_comments, all_errors = [], [], []
-
-    excel_files = [
-        f for f in os.listdir(input_folder)
-        if f.lower().endswith((".xlsx", ".xlsm")) and not f.startswith("~$")
-    ]
-
-    if not excel_files:
-        print(f"No .xlsx/.xlsm files found in {input_folder}")
-
-    for fname in excel_files:
-        filepath = os.path.join(input_folder, fname)
-        print(f"Scanning: {fname}")
-        result = crawl_file(filepath)
-        all_headers.extend(result["headers"])
-        all_named_ranges.extend(result["named_ranges"])
-        all_external_links.extend(result["external_links"])
-        all_comments.extend(result["comments"])
-        all_errors.extend(result["errors"])
-
-    return {
-        "headers": pd.DataFrame(all_headers),
-        "named_ranges": pd.DataFrame(all_named_ranges),
-        "external_links": pd.DataFrame(all_external_links),
-        "comments": pd.DataFrame(all_comments),
-        "errors": pd.DataFrame(all_errors),
-    }
-
-
-def write_inventory(dataframes, output_path):
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        # Summary tab first
-        summary = pd.DataFrame({
-            "Metric": [
-                "Generated On",
-                "Fields Discovered",
-                "Named Ranges Discovered",
-                "Cross-File Formula References",
-                "Comments Captured",
-                "Files with Errors",
-            ],
-            "Value": [
-                datetime.now().strftime("%Y-%m-%d %H:%M"),
-                len(dataframes["headers"]),
-                len(dataframes["named_ranges"]),
-                len(dataframes["external_links"]),
-                len(dataframes["comments"]),
-                dataframes["errors"]["File"].nunique() if not dataframes["errors"].empty else 0,
-            ],
-        })
-        summary.to_excel(writer, sheet_name="Summary", index=False)
-
-        dataframes["headers"].to_excel(writer, sheet_name="Field Inventory", index=False)
-        dataframes["named_ranges"].to_excel(writer, sheet_name="Named Ranges", index=False)
-        dataframes["external_links"].to_excel(writer, sheet_name="Cross-File Links", index=False)
-        dataframes["comments"].to_excel(writer, sheet_name="Cell Comments", index=False)
-        dataframes["errors"].to_excel(writer, sheet_name="Scan Errors", index=False)
-
-    print(f"\nInventory written to: {output_path}")
-
-
-def main():
-    if len(sys.argv) != 3:
-        print("Usage: python tax_metadata_crawler.py <input_folder> <output_file.xlsx>")
-        sys.exit(1)
-
-    input_folder = sys.argv[1]
-    output_path = sys.argv[2]
-
-    if not os.path.isdir(input_folder):
-        print(f"Input folder not found: {input_folder}")
-        sys.exit(1)
-
-    dataframes = crawl_folder(input_folder)
-    write_inventory(dataframes, output_path)
-
-
-if __name__ == "__main__":
-    main()
+    tabs = st.tabs([
+        "Field Inventory", "Named Ranges", "Cross-File Links", "Cell Comments", "Scan Errors"
+    ])
+    with tabs[0]:
+        st.dataframe(dfs["headers"], use_container_width=True)
+    with tabs[1]:
+        st.dataframe(dfs["named_ranges"], use_container_width=True)
+    with tabs[2]:
+        st.dataframe(dfs["external_links"], use_container_width=True)
+    with tabs[3]:
+        st.dataframe(dfs["comments"], use_container_width=True)
+    with tabs[4]:
+        if dfs["errors"].empty:
+            st.info("No errors.")
+        else:
+            st.dataframe(dfs["errors"], use_container_width=True)
+else:
+    st.info("Upload file(s) and click 'Run Inventory Scan' to begin.")
