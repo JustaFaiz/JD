@@ -1,0 +1,132 @@
+"""
+Tax Data Inventory Dashboard
+-----------------------------
+Small Streamlit UI on top of tax_metadata_crawler.py. Lets you pick
+which workpaper file(s) to scan (instead of pointing the script at a
+whole folder), preview the results, and download the inventory workbook.
+
+USAGE:
+    streamlit run tax_inventory_dashboard.py
+
+Requires: streamlit, openpyxl, pandas
+    pip install streamlit
+
+IMPORTANT: this file must sit in the same folder as tax_metadata_crawler.py
+"""
+
+import io
+import os
+import tempfile
+
+import pandas as pd
+import streamlit as st
+
+from tax_metadata_crawler import crawl_files, write_inventory, SYSTEM_KEYWORDS
+
+st.set_page_config(page_title="Tax Data Inventory Crawler", layout="wide")
+
+st.title("Tax Data Inventory Crawler")
+st.caption(
+    "Upload the specific workpaper(s) you've confirmed are in scope. "
+    "The scan reads structure only (sheet names, headers, named ranges, "
+    "comments, cross-file formula links) — never cell values."
+)
+
+# ---- File selection -------------------------------------------------
+uploaded_files = st.file_uploader(
+    "Select workpaper file(s) to scan",
+    type=["xlsx", "xlsm"],
+    accept_multiple_files=True,
+)
+
+with st.expander("System-guess keywords (optional — edit to match your file naming)"):
+    st.write(
+        "The scanner tags each file with a guessed source system based on "
+        "keywords in the filename. Adjust below if your naming differs."
+    )
+    edited_keywords = {}
+    for system, keywords in SYSTEM_KEYWORDS.items():
+        default_val = ", ".join(keywords)
+        user_val = st.text_input(f"{system} keywords", value=default_val)
+        edited_keywords[system] = [k.strip().lower() for k in user_val.split(",") if k.strip()]
+
+run_scan = st.button("Run Inventory Scan", type="primary", disabled=not uploaded_files)
+
+# ---- Run scan ---------------------------------------------------------
+if run_scan and uploaded_files:
+    # Apply any keyword edits from the sidebar back into the shared module
+    SYSTEM_KEYWORDS.clear()
+    SYSTEM_KEYWORDS.update(edited_keywords)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        saved_paths = []
+        for uploaded in uploaded_files:
+            path = os.path.join(tmpdir, uploaded.name)
+            with open(path, "wb") as f:
+                f.write(uploaded.getbuffer())
+            saved_paths.append(path)
+
+        progress_bar = st.progress(0.0, text="Starting scan...")
+        status_text = st.empty()
+
+        scanned = {"count": 0}
+
+        def report_progress(fname):
+            scanned["count"] += 1
+            pct = scanned["count"] / len(saved_paths)
+            progress_bar.progress(pct, text=f"Scanning: {fname}")
+
+        dataframes = crawl_files(saved_paths, progress_callback=report_progress)
+        progress_bar.progress(1.0, text="Scan complete")
+        status_text.success(f"Scanned {len(saved_paths)} file(s).")
+
+        # Persist results in session_state so the download button
+        # (which triggers a rerun) doesn't lose the scan.
+        st.session_state["dataframes"] = dataframes
+
+        # Also build the downloadable workbook in memory now
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp_out:
+            out_path = tmp_out.name
+        write_inventory(dataframes, out_path)
+        with open(out_path, "rb") as f:
+            st.session_state["output_bytes"] = f.read()
+        os.remove(out_path)
+
+# ---- Display results ----------------------------------------------
+if "dataframes" in st.session_state:
+    dfs = st.session_state["dataframes"]
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Fields discovered", len(dfs["headers"]))
+    col2.metric("Named ranges", len(dfs["named_ranges"]))
+    col3.metric("Cross-file links", len(dfs["external_links"]))
+    col4.metric(
+        "Files with errors",
+        dfs["errors"]["File"].nunique() if not dfs["errors"].empty else 0,
+    )
+
+    st.download_button(
+        label="Download Tax Data Inventory (.xlsx)",
+        data=st.session_state["output_bytes"],
+        file_name="Tax_Data_Inventory_Draft.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    tabs = st.tabs([
+        "Field Inventory", "Named Ranges", "Cross-File Links", "Cell Comments", "Scan Errors"
+    ])
+    with tabs[0]:
+        st.dataframe(dfs["headers"], use_container_width=True)
+    with tabs[1]:
+        st.dataframe(dfs["named_ranges"], use_container_width=True)
+    with tabs[2]:
+        st.dataframe(dfs["external_links"], use_container_width=True)
+    with tabs[3]:
+        st.dataframe(dfs["comments"], use_container_width=True)
+    with tabs[4]:
+        if dfs["errors"].empty:
+            st.info("No errors.")
+        else:
+            st.dataframe(dfs["errors"], use_container_width=True)
+else:
+    st.info("Upload file(s) and click 'Run Inventory Scan' to begin.")
