@@ -250,8 +250,13 @@ def crawl_file(filepath, fast_mode=False, sheet_progress_callback=None):
 
     sheetnames = wb.sheetnames
     total_sheets = len(sheetnames)
-    file_headers = []          # collected here, classified once at the end
-    field_names_seen = []      # feeds the column-header fallback signal
+
+    # Filename is a legitimate file-wide signal — if it matches, every
+    # sheet in the file gets that answer. If it DOESN'T match, we fall
+    # back to per-SHEET classification below (not per-file) — this is
+    # the fix: a workbook can genuinely mix tabs from different systems,
+    # so one tab mentioning "SAP" must not tag every other tab in the file.
+    file_level_guess, file_matched_on = guess_system(file_name)
 
     for idx, sheet_name in enumerate(sheetnames, start=1):
         if sheet_progress_callback:
@@ -260,12 +265,22 @@ def crawl_file(filepath, fast_mode=False, sheet_progress_callback=None):
         try:
             if fast_mode:
                 headers = _scan_sheet_fast(ws, sheet_name, file_name, None)
-                file_headers.extend(headers)
             else:
                 headers, comments, links = _scan_sheet_full(ws, sheet_name, file_name, None)
-                file_headers.extend(headers)
                 result["comments"].extend(comments)
                 result["external_links"].extend(links)
+
+            if file_level_guess != "Unclassified":
+                sheet_guess, matched_on = file_level_guess, file_matched_on
+            else:
+                sheet_field_names = [h["Field Name"] for h in headers]
+                sheet_guess, matched_on = guess_system(
+                    file_name, sheet_names=[sheet_name], field_names=sheet_field_names
+                )
+            for h in headers:
+                h["System (guess)"] = sheet_guess
+                h["Matched On"] = matched_on
+            result["headers"].extend(headers)
 
             if not headers:
                 result["errors"].append({
@@ -283,15 +298,6 @@ def crawl_file(filepath, fast_mode=False, sheet_progress_callback=None):
         result["named_ranges"].extend(extract_named_ranges(wb, file_name))
     except Exception as e:
         result["errors"].append({"File": file_name, "Issue": f"Named range scan failed: {e}"})
-
-    # Classify once, using every signal gathered from the whole file —
-    # far more reliable than guessing from the filename alone.
-    field_names_seen = [h["Field Name"] for h in file_headers]
-    system_guess, matched_on = guess_system(file_name, sheet_names=sheetnames, field_names=field_names_seen)
-    for h in file_headers:
-        h["System (guess)"] = system_guess
-        h["Matched On"] = matched_on
-    result["headers"].extend(file_headers)
 
     return result
 
