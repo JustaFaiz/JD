@@ -1,0 +1,363 @@
+"""
+Tax Data Inventory Crawler
+---------------------------
+Walks a folder of tax workpapers (.xlsx/.xlsm), extracts structural
+metadata from each file, and writes it into a multi-tab Excel workbook
+that seeds the Tax Data Inventory / Metadata Repository.
+
+It does NOT read or move business data (cell values, dollar amounts,
+taxpayer figures) — only structure: sheet names, headers, named ranges,
+external links, comments, and formulas that reference other files.
+
+Tabs can contain MULTIPLE stacked header blocks (e.g. headers on rows
+1, 3, 4, 7 with data rows in between). The scanner checks every row
+independently rather than stopping at the first header-looking row —
+see _is_header_row() for the detection rule.
+
+USAGE:
+    python tax_metadata_crawler.py <input_folder> <output_file.xlsx> [--fast]
+
+    --fast : headers-only mode. Skips comments and cross-file link
+             detection and loads workbooks in read-only mode. Much
+             faster on files with many tabs; use it for a first pass,
+             then re-run without --fast on the specific files where you
+             need comments/link detail.
+
+Example:
+    python tax_metadata_crawler.py "C:\\Tax\\Workpapers" "Tax_Data_Inventory_Draft.xlsx" --fast
+
+Requires: openpyxl, pandas  (both already in your environment)
+"""
+
+import os
+import re
+import sys
+from datetime import datetime
+
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+# Keyword hints used to guess which upstream/downstream system a file
+# belongs to, based on filename. Edit this dict to match your naming
+# conventions — it's a starting guess, not a source of truth.
+SYSTEM_KEYWORDS = {
+    "SAP": ["sap", "fico", "trial balance", "tb_"],
+    "Longview": ["longview", "lv_"],
+    "Corptax": ["corptax", "ctx_"],
+    "Excel Workpaper": [],  # fallback bucket, always matches last
+}
+
+EXTERNAL_REF_PATTERN = re.compile(r"\[\d+\]")  # e.g. ='[1]Sheet1'!$A$1
+MAX_HEADER_SCAN_ROWS = 200  # how deep into a sheet to look for header rows
+MAX_SCAN_COLS = 40          # how many columns to check per row
+MIN_NON_EMPTY_FOR_HEADER = 3   # a header row needs at least this many filled cells
+TEXT_RATIO_THRESHOLD = 0.7     # and at least this fraction of them must be text, not numbers
+
+# Excel workbooks very often report a max_row/max_column far beyond where
+# real data ends (leftover formatting, a stray styled cell, an old paste).
+# Without a cutoff, a scan walks thousands of phantom empty rows per sheet
+# for nothing. Once we hit this many CONSECUTIVE fully-empty rows, we stop
+# scanning that sheet — real data this sparse is not a realistic layout.
+EMPTY_ROW_BREAK = 60
+
+
+def guess_system(filename: str) -> str:
+    name_lower = filename.lower()
+    for system, keywords in SYSTEM_KEYWORDS.items():
+        for kw in keywords:
+            if kw in name_lower:
+                return system
+    return "Unclassified"
+
+
+def _looks_numeric(value) -> bool:
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        cleaned = value.strip().replace(",", "").replace("$", "").replace("%", "")
+        try:
+            float(cleaned)
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _is_header_row(values) -> bool:
+    """
+    A row is treated as a header row if it has enough filled cells and
+    most of them are text labels rather than numbers/dates — this is
+    what distinguishes a header block from a data row, independent of
+    where in the sheet it sits. Doesn't require a blank separator row.
+    Takes plain values (not Cell objects) so it works for both the
+    lightweight values_only scan and the full Cell-object scan.
+    """
+    non_empty = [v for v in values if v not in (None, "")]
+    if len(non_empty) < MIN_NON_EMPTY_FOR_HEADER:
+        return False
+    text_like = sum(1 for v in non_empty if isinstance(v, str) and not _looks_numeric(v))
+    return (text_like / len(non_empty)) >= TEXT_RATIO_THRESHOLD
+
+
+def extract_named_ranges(wb, file_name):
+    records = []
+    for name, defined_name in wb.defined_names.items():
+        records.append({
+            "File": file_name,
+            "Name": name,
+            "RefersTo": defined_name.attr_text,
+        })
+    return records
+
+
+def _header_records_from_values(values, r_idx, sheet_name, file_name, system_guess):
+    records = []
+    for col_idx, val in enumerate(values, start=1):
+        if val not in (None, ""):
+            records.append({
+                "System (guess)": system_guess,
+                "File": file_name,
+                "Sheet": sheet_name,
+                "Header Row": r_idx,
+                "Column": get_column_letter(col_idx),
+                "Field Name": str(val).strip(),
+                "Owner": "",
+                "Downstream Use": "",
+            })
+    return records
+
+
+def _scan_sheet_fast(ws, sheet_name, file_name, system_guess):
+    """
+    Headers only, multiple blocks per sheet. values_only=True skips
+    building Cell objects entirely (we don't need comments/formulas
+    here) — plain tuples of values are much cheaper to scan. Stops
+    early on a long run of empty rows or after MAX_HEADER_SCAN_ROWS,
+    whichever comes first.
+    """
+    headers = []
+    empty_streak = 0
+
+    for r_idx, values in enumerate(
+        ws.iter_rows(min_row=1, max_row=MAX_HEADER_SCAN_ROWS, max_col=MAX_SCAN_COLS, values_only=True),
+        start=1,
+    ):
+        if all(v in (None, "") for v in values):
+            empty_streak += 1
+            if empty_streak >= EMPTY_ROW_BREAK:
+                break
+            continue
+        empty_streak = 0
+
+        if _is_header_row(values):
+            headers.extend(_header_records_from_values(values, r_idx, sheet_name, file_name, system_guess))
+
+    return headers
+
+
+def _scan_sheet_full(ws, sheet_name, file_name, system_guess):
+    """
+    Full scan: header detection (multiple blocks) + comments + cross-file
+    formula links, all in a single pass over the sheet. Stops early on a
+    long run of empty rows — protects against Excel's common phantom
+    max_row inflation (formatting or a stray edit far past real data)
+    turning a 10-row sheet into a 5000-row scan.
+    """
+    headers, comments, links = [], [], []
+    empty_streak = 0
+
+    for row in ws.iter_rows(min_row=1):
+        r_idx = row[0].row
+        row_values = [c.value for c in row]
+
+        if all(v in (None, "") for v in row_values):
+            empty_streak += 1
+            if empty_streak >= EMPTY_ROW_BREAK:
+                break
+            continue
+        empty_streak = 0
+
+        if r_idx <= MAX_HEADER_SCAN_ROWS and _is_header_row(row_values[:MAX_SCAN_COLS]):
+            headers.extend(
+                _header_records_from_values(row_values[:MAX_SCAN_COLS], r_idx, sheet_name, file_name, system_guess)
+            )
+
+        for cell in row:
+            if cell.comment is not None:
+                comments.append({
+                    "File": file_name,
+                    "Sheet": sheet_name,
+                    "Cell": cell.coordinate,
+                    "Author": cell.comment.author,
+                    "Comment": cell.comment.text.strip(),
+                })
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                if EXTERNAL_REF_PATTERN.search(cell.value):
+                    links.append({
+                        "File": file_name,
+                        "Sheet": sheet_name,
+                        "Cell": cell.coordinate,
+                        "Formula": cell.value,
+                    })
+
+    return headers, comments, links
+
+
+def crawl_file(filepath, fast_mode=False, sheet_progress_callback=None):
+    """
+    Returns a dict of lists: headers, named_ranges, external_links, comments, errors.
+
+    A sheet can now contribute MULTIPLE header rows — each detected
+    header block appears as its own set of rows in "headers", identified
+    by its own "Header Row" number, so stacked tables in one tab all
+    get captured.
+
+    fast_mode=True: read-only load, headers only, skips comments/cross-file
+    links entirely, and only reads the first MAX_HEADER_SCAN_ROWS of each sheet.
+
+    sheet_progress_callback(file_name, sheet_idx, total_sheets, sheet_name),
+    if given, is called before each sheet is scanned.
+    """
+    file_name = os.path.basename(filepath)
+    result = {"headers": [], "named_ranges": [], "external_links": [], "comments": [], "errors": []}
+
+    try:
+        wb = load_workbook(filepath, data_only=False, keep_links=True, read_only=fast_mode)
+    except Exception as e:
+        result["errors"].append({"File": file_name, "Issue": f"Could not open file: {e}"})
+        return result
+
+    system_guess = guess_system(file_name)
+    sheetnames = wb.sheetnames
+    total_sheets = len(sheetnames)
+
+    for idx, sheet_name in enumerate(sheetnames, start=1):
+        if sheet_progress_callback:
+            sheet_progress_callback(file_name, idx, total_sheets, sheet_name)
+        ws = wb[sheet_name]
+        try:
+            if fast_mode:
+                headers = _scan_sheet_fast(ws, sheet_name, file_name, system_guess)
+                result["headers"].extend(headers)
+            else:
+                headers, comments, links = _scan_sheet_full(ws, sheet_name, file_name, system_guess)
+                result["headers"].extend(headers)
+                result["comments"].extend(comments)
+                result["external_links"].extend(links)
+
+            if not headers:
+                result["errors"].append({
+                    "File": file_name,
+                    "Issue": f"No header row found on sheet '{sheet_name}' "
+                             f"(checked first {MAX_HEADER_SCAN_ROWS} rows)",
+                })
+        except Exception as e:
+            result["errors"].append({
+                "File": file_name,
+                "Issue": f"Scan failed on sheet '{sheet_name}': {e}",
+            })
+
+    try:
+        result["named_ranges"].extend(extract_named_ranges(wb, file_name))
+    except Exception as e:
+        result["errors"].append({"File": file_name, "Issue": f"Named range scan failed: {e}"})
+
+    return result
+
+
+def crawl_files(filepaths, fast_mode=False, progress_callback=None, sheet_progress_callback=None):
+    """
+    Scans a given list of workbook filepaths (as opposed to a whole folder).
+    Used directly by the Streamlit dashboard, and by crawl_folder() below.
+    progress_callback(filename) is called before each file is scanned, if provided.
+    """
+    all_headers, all_named_ranges = [], []
+    all_external_links, all_comments, all_errors = [], [], []
+
+    for filepath in filepaths:
+        fname = os.path.basename(filepath)
+        if progress_callback:
+            progress_callback(fname)
+        else:
+            print(f"Scanning: {fname}")
+        result = crawl_file(filepath, fast_mode=fast_mode, sheet_progress_callback=sheet_progress_callback)
+        all_headers.extend(result["headers"])
+        all_named_ranges.extend(result["named_ranges"])
+        all_external_links.extend(result["external_links"])
+        all_comments.extend(result["comments"])
+        all_errors.extend(result["errors"])
+
+    return {
+        "headers": pd.DataFrame(all_headers),
+        "named_ranges": pd.DataFrame(all_named_ranges),
+        "external_links": pd.DataFrame(all_external_links),
+        "comments": pd.DataFrame(all_comments),
+        "errors": pd.DataFrame(all_errors),
+    }
+
+
+def crawl_folder(input_folder, fast_mode=False):
+    excel_files = [
+        os.path.join(input_folder, f) for f in os.listdir(input_folder)
+        if f.lower().endswith((".xlsx", ".xlsm")) and not f.startswith("~$")
+    ]
+
+    if not excel_files:
+        print(f"No .xlsx/.xlsm files found in {input_folder}")
+
+    return crawl_files(excel_files, fast_mode=fast_mode)
+
+
+def write_inventory(dataframes, output_path):
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        summary = pd.DataFrame({
+            "Metric": [
+                "Generated On",
+                "Fields Discovered",
+                "Named Ranges Discovered",
+                "Cross-File Formula References",
+                "Comments Captured",
+                "Files with Errors",
+            ],
+            "Value": [
+                datetime.now().strftime("%Y-%m-%d %H:%M"),
+                len(dataframes["headers"]),
+                len(dataframes["named_ranges"]),
+                len(dataframes["external_links"]),
+                len(dataframes["comments"]),
+                dataframes["errors"]["File"].nunique() if not dataframes["errors"].empty else 0,
+            ],
+        })
+        summary.to_excel(writer, sheet_name="Summary", index=False)
+        dataframes["headers"].to_excel(writer, sheet_name="Field Inventory", index=False)
+        dataframes["named_ranges"].to_excel(writer, sheet_name="Named Ranges", index=False)
+        dataframes["external_links"].to_excel(writer, sheet_name="Cross-File Links", index=False)
+        dataframes["comments"].to_excel(writer, sheet_name="Cell Comments", index=False)
+        dataframes["errors"].to_excel(writer, sheet_name="Scan Errors", index=False)
+
+    print(f"\nInventory written to: {output_path}")
+
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: python tax_metadata_crawler.py <input_folder> <output_file.xlsx> [--fast]")
+        sys.exit(1)
+
+    input_folder = sys.argv[1]
+    output_path = sys.argv[2]
+    fast_mode = "--fast" in sys.argv[3:]
+
+    if not os.path.isdir(input_folder):
+        print(f"Input folder not found: {input_folder}")
+        sys.exit(1)
+
+    if fast_mode:
+        print("Running in FAST mode: headers only, no comments/cross-file link scan.")
+
+    dataframes = crawl_folder(input_folder, fast_mode=fast_mode)
+    write_inventory(dataframes, output_path)
+
+
+if __name__ == "__main__":
+    main()
