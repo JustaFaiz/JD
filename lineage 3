@@ -1,0 +1,455 @@
+"""
+Streamlit dashboard for end-to-end lineage discovery -- reference-based
+tab classification version.
+
+Built for workpapers with MANY tabs (100+) where most sheet names are
+uninformative. Instead of guessing each tab's system from its name or a
+hardcoded keyword list, you confirm a handful of REFERENCE tabs (the ones
+whose names you already trust), and every other tab gets classified by how
+closely its actual columns and values match those references -- weighted
+mostly toward value overlap, since that's the reliable signal at this scale.
+
+Run with:
+    streamlit run lineage_dashboard.py
+"""
+
+import io
+
+import pandas as pd
+import streamlit as st
+from rapidfuzz import fuzz
+
+
+SYSTEM_LABELS = ["SAP_TB", "ERS", "DTTU", "Longview", "Corptax", "Filing"]
+
+# Used ONLY to suggest a sensible default reference tab per system in step 2
+# -- not used anywhere in the actual classification of the other tabs.
+SYSTEM_NAME_ALIASES = {
+    "SAP_TB":   ["sap", "tb", "trial balance", "sap tb", "gl extract"],
+    "ERS":      ["ers", "estimated return summary"],
+    "DTTU":     ["dttu", "deferred tax true up", "deferred tax true-up", "true up", "true-up"],
+    "Longview": ["longview", "lv", "lv upload", "upload template", "consolidation"],
+    "Corptax":  ["corptax", "corp tax", "ctx", "corptax import"],
+    "Filing":   ["filing", "return", "schedule", "tax return", "filed"],
+}
+
+MAX_COLS_FOR_CLASSIFICATION = 15   # cap columns compared per tab, for speed at 100+ tabs
+MAX_ROWS_FOR_VALUE_MATCH = 300     # sample cap for value-overlap comparisons
+
+
+# ---------------------------------------------------------------------------
+# CONTENT-BASED CLASSIFICATION -- compare each tab to reference tabs
+# ---------------------------------------------------------------------------
+
+def value_overlap_score(series_a: pd.Series, series_b: pd.Series) -> float:
+    set_a = set(series_a.dropna().astype(str).str.strip().str.upper())
+    set_b = set(series_b.dropna().astype(str).str.strip().str.upper())
+    if not set_a or not set_b:
+        return 0.0
+    smaller = min(len(set_a), len(set_b))
+    return (len(set_a & set_b) / smaller) if smaller else 0.0
+
+
+def tab_similarity(df_a: pd.DataFrame, df_b: pd.DataFrame):
+    """
+    Returns (name_similarity, value_similarity), each 0-100.
+    name_similarity: average best fuzzy match between df_a's column names and df_b's.
+    value_similarity: average best value-set overlap between df_a's columns and df_b's --
+    this is the signal that survives even when headers are renamed or sheet names mean nothing.
+    """
+    cols_a = list(df_a.columns)[:MAX_COLS_FOR_CLASSIFICATION]
+    cols_b = list(df_b.columns)[:MAX_COLS_FOR_CLASSIFICATION]
+    if not cols_a or not cols_b:
+        return 0.0, 0.0
+
+    name_scores = [
+        max((fuzz.token_sort_ratio(str(ca), str(cb)) for cb in cols_b), default=0)
+        for ca in cols_a
+    ]
+    name_sim = sum(name_scores) / len(name_scores)
+
+    sample_a = df_a[cols_a].head(MAX_ROWS_FOR_VALUE_MATCH)
+    sample_b = df_b[cols_b].head(MAX_ROWS_FOR_VALUE_MATCH)
+    value_scores = []
+    for ca in cols_a:
+        best_val = 0.0
+        for cb in cols_b:
+            try:
+                score = value_overlap_score(sample_a[ca], sample_b[cb])
+            except Exception:
+                score = 0.0
+            best_val = max(best_val, score)
+        value_scores.append(best_val)
+    value_sim = (sum(value_scores) / len(value_scores)) * 100 if value_scores else 0.0
+
+    return round(name_sim), round(value_sim)
+
+
+def classify_tab(df: pd.DataFrame, reference_dfs: dict, name_weight: float, value_weight: float):
+    """
+    Scores df against every reference tab and returns the best match.
+    name_weight/value_weight let you control the balance -- default is
+    weighted toward value overlap, per your workpaper having mostly
+    uninformative sheet names.
+    """
+    best_system, best_combined, best_name, best_value = "Unassigned", -1, 0, 0
+    for system, ref_df in reference_dfs.items():
+        name_sim, value_sim = tab_similarity(df, ref_df)
+        combined = name_weight * name_sim + value_weight * value_sim
+        if combined > best_combined:
+            best_system, best_combined, best_name, best_value = system, combined, name_sim, value_sim
+    return best_system, round(max(best_combined, 0)), best_name, best_value
+
+
+# ---------------------------------------------------------------------------
+# LINEAGE MATCHING LOGIC (system-level, used after classification)
+# ---------------------------------------------------------------------------
+
+def match_headers(df_a: pd.DataFrame, df_b: pd.DataFrame, threshold: int):
+    matches = []
+    used_targets = set()
+    for col_a in df_a.columns:
+        best_score, best_col_b, best_method = 0, None, None
+        for col_b in df_b.columns:
+            if col_b in used_targets:
+                continue
+            sort_score = fuzz.token_sort_ratio(str(col_a), str(col_b))
+            partial_score = fuzz.partial_ratio(str(col_a), str(col_b))
+            score, method = max((sort_score, "token_sort"), (partial_score, "partial"))
+            if score > best_score:
+                best_score, best_col_b, best_method = score, col_b, method
+        if best_score >= threshold:
+            matches.append({
+                "source_field": col_a, "target_field": best_col_b,
+                "score": best_score, "method": f"name:{best_method}",
+            })
+            used_targets.add(best_col_b)
+    return matches
+
+
+def match_by_values(df_a: pd.DataFrame, df_b: pd.DataFrame,
+                     already_matched_targets: set, threshold: float):
+    matches = []
+    used_targets = set(already_matched_targets)
+    for col_a in df_a.columns:
+        best_score, best_col_b = 0.0, None
+        for col_b in df_b.columns:
+            if col_b in used_targets:
+                continue
+            if df_a[col_a].dtype.kind not in "OUS" and df_b[col_b].dtype.kind in "OUS":
+                continue
+            score = value_overlap_score(df_a[col_a], df_b[col_b])
+            if score > best_score:
+                best_score, best_col_b = score, col_b
+        if best_score >= threshold:
+            matches.append({
+                "source_field": col_a, "target_field": best_col_b,
+                "score": round(best_score * 100, 1), "method": "value_overlap",
+            })
+            used_targets.add(best_col_b)
+    return matches
+
+
+def field_level_mapping(df_a, df_b, source_system, target_system,
+                         header_threshold, value_threshold):
+    header_matches = match_headers(df_a, df_b, header_threshold)
+    matched_targets = {m["target_field"] for m in header_matches}
+    value_matches = match_by_values(df_a, df_b, matched_targets, value_threshold)
+    all_matches = header_matches + value_matches
+    matched_targets |= {m["target_field"] for m in value_matches}
+
+    rows = []
+    for m in all_matches:
+        rows.append({
+            "Source System": source_system, "Source Field": m["source_field"],
+            "Transformation": "direct" if m["score"] >= 95 else "mapped/renamed",
+            "Target System": target_system, "Target Field": m["target_field"],
+            "Adjustment Type": "", "Match Confidence": m["score"],
+            "Match Method": m["method"], "SME Confirmed": "Pending",
+        })
+    for col_b in df_b.columns:
+        if col_b not in matched_targets:
+            rows.append({
+                "Source System": "(none found)", "Source Field": "",
+                "Transformation": "manual/adjustment - unverified",
+                "Target System": target_system, "Target Field": col_b,
+                "Adjustment Type": "Candidate M-1/M-3 or manual entry - CONFIRM WITH SME",
+                "Match Confidence": 0, "Match Method": "no_match", "SME Confirmed": "Pending",
+            })
+    return pd.DataFrame(rows)
+
+
+def pairwise_overlap_report(dfs: dict, header_threshold: int, value_threshold: float,
+                             min_matched_fields: int) -> pd.DataFrame:
+    import itertools
+    results = []
+    for sys_a, sys_b in itertools.permutations(dfs.keys(), 2):
+        df_a, df_b = dfs[sys_a], dfs[sys_b]
+        header_matches = match_headers(df_a, df_b, header_threshold)
+        matched_targets = {m["target_field"] for m in header_matches}
+        value_matches = match_by_values(df_a, df_b, matched_targets, value_threshold)
+        total = len(header_matches) + len(value_matches)
+        avg_conf = (sum(m["score"] for m in header_matches + value_matches) / total) if total else 0
+        results.append({
+            "From": sys_a, "To": sys_b, "Matched Fields": total,
+            "Avg Confidence": round(avg_conf, 1),
+            "Candidate Edge": total >= min_matched_fields,
+        })
+    columns = ["From", "To", "Matched Fields", "Avg Confidence", "Candidate Edge"]
+    if not results:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(results, columns=columns).sort_values(
+        ["Candidate Edge", "Matched Fields"], ascending=[False, False]
+    ).reset_index(drop=True)
+
+
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+    return buf.getvalue()
+
+
+def build_lineage_diagram(report: pd.DataFrame, confirmed_pair: tuple = None) -> str:
+    edges = report[report["Candidate Edge"]] if not report.empty else report
+    nodes = sorted(set(edges["From"]) | set(edges["To"]))
+    lines = [
+        'digraph lineage {', '  rankdir=LR;',
+        '  node [shape=box, style="rounded,filled", fillcolor="#eaf1fb", fontname="Helvetica", fontsize=11];',
+        '  edge [fontname="Helvetica", fontsize=9];',
+    ]
+    for n in nodes:
+        lines.append(f'  "{n}";')
+    for _, row in edges.iterrows():
+        conf = row["Avg Confidence"]
+        color = "#2e7d32" if conf >= 80 else ("#f9a825" if conf >= 60 else "#c62828")
+        is_selected = confirmed_pair and (row["From"], row["To"]) == confirmed_pair
+        penwidth = 3 if is_selected else 1.5
+        label = f'{int(row["Matched Fields"])} fields, {conf:.0f}%'
+        lines.append(f'  "{row["From"]}" -> "{row["To"]}" [label="{label}", color="{color}", penwidth={penwidth}];')
+    lines.append('}')
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# STREAMLIT UI
+# ---------------------------------------------------------------------------
+
+st.set_page_config(page_title="Lineage Discovery", layout="wide")
+st.title("End-to-End Lineage Discovery")
+st.caption("Upload one workpaper (many tabs) → confirm a few reference tabs → classify everything else by content → discover connections → build the mapping log.")
+
+with st.sidebar:
+    st.header("Classification weighting")
+    value_weight_pct = st.slider(
+        "Weight on value overlap vs. column names", 0, 100, 75,
+        help="Higher = classification leans more on actual cell values matching, less on column-name similarity. Sheet names aren't used here at all.",
+    )
+    value_weight = value_weight_pct / 100
+    name_weight = 1 - value_weight
+
+    st.header("Lineage matching sensitivity")
+    header_threshold = st.slider("Header name match threshold", 50, 100, 80)
+    match_value_threshold = st.slider("Field value overlap threshold", 0.0, 1.0, 0.5, 0.05)
+    min_matched_fields = st.slider("Min matched fields to call it a candidate edge", 1, 10, 2)
+
+st.subheader("1. Upload your workpaper")
+workpaper = st.file_uploader("Excel workbook with many tabs", type=["xlsx", "xls"])
+
+if workpaper is not None:
+    if "raw_sheets" not in st.session_state or st.session_state.get("_wp_name") != workpaper.name:
+        with st.spinner("Reading all tabs..."):
+            st.session_state["raw_sheets"] = pd.read_excel(workpaper, sheet_name=None)
+            st.session_state["_wp_name"] = workpaper.name
+    raw_sheets = st.session_state["raw_sheets"]
+    st.success(f"Found {len(raw_sheets)} tabs.")
+
+    st.subheader("2. Confirm a reference tab for each system")
+    st.write(
+        "Pick the tab(s) you already trust by name for each system. These become the "
+        "exemplars everything else gets compared against. Leave a system as *(none)* "
+        "if you have no confidently-named tab for it yet -- it just won't be classifiable "
+        "until you do."
+    )
+
+    sheet_names = list(raw_sheets.keys())
+    reference_choice = {}
+    ref_cols = st.columns(3)
+    for i, system in enumerate(SYSTEM_LABELS):
+        best_guess, best_score = None, 0
+        for name in sheet_names:
+            score = max(fuzz.partial_ratio(name.lower(), a) for a in SYSTEM_NAME_ALIASES[system])
+            if score > best_score:
+                best_guess, best_score = name, score
+        options = ["(none)"] + sheet_names
+        default_idx = options.index(best_guess) if best_guess and best_score >= 75 else 0
+        with ref_cols[i % 3]:
+            choice = st.selectbox(f"{system} reference", options, index=default_idx, key=f"ref_{system}")
+            reference_choice[system] = None if choice == "(none)" else choice
+
+    reference_dfs = {sys_: raw_sheets[name] for sys_, name in reference_choice.items() if name}
+    reference_sheet_names = set(reference_choice.values()) - {None}
+
+    st.divider()
+    st.subheader("3. Classify remaining tabs by content")
+    st.write(f"Reference tabs set: {reference_dfs.keys() if reference_dfs else 'none yet'}. Weighting: {value_weight_pct}% value overlap / {100 - value_weight_pct}% column names.")
+
+    if st.button("Classify all tabs", type="primary", disabled=len(reference_dfs) < 1):
+        rows = []
+        progress = st.progress(0.0, text="Classifying tabs...")
+        non_ref_names = [n for n in sheet_names if n not in reference_sheet_names]
+        for i, name in enumerate(non_ref_names):
+            guess, confidence, name_score, value_score = classify_tab(
+                raw_sheets[name], reference_dfs, name_weight, value_weight
+            )
+            rows.append({
+                "Sheet Name": name, "Rows": len(raw_sheets[name]), "Cols": len(raw_sheets[name].columns),
+                "Guessed System": guess, "Confidence": confidence,
+                "Name Score": name_score, "Value Score": value_score,
+                "Final System": guess,
+            })
+            progress.progress((i + 1) / max(len(non_ref_names), 1), text=f"Classifying tabs... ({i + 1}/{len(non_ref_names)})")
+        progress.empty()
+
+        for system, name in reference_choice.items():
+            if name:
+                rows.insert(0, {
+                    "Sheet Name": name, "Rows": len(raw_sheets[name]), "Cols": len(raw_sheets[name].columns),
+                    "Guessed System": system, "Confidence": 100,
+                    "Name Score": 100, "Value Score": 100,
+                    "Final System": system,
+                })
+        st.session_state["classification_df"] = pd.DataFrame(rows)
+
+    if "classification_df" in st.session_state:
+        cdf = st.session_state["classification_df"]
+
+        show_low_only = st.checkbox("Show only low-confidence tabs (below 70) needing review", value=True)
+        search = st.text_input("Filter by sheet name contains", "")
+
+        display_df = cdf.copy()
+        if show_low_only:
+            display_df = display_df[display_df["Confidence"] < 70]
+        if search:
+            display_df = display_df[display_df["Sheet Name"].str.contains(search, case=False, na=False)]
+
+        st.write(f"Showing {len(display_df)} of {len(cdf)} tabs. Edit **Final System** directly in the table below (type any label, or 'Skip' to exclude a tab).")
+
+        edited = st.data_editor(
+            display_df.sort_values("Confidence"),
+            column_config={
+                "Final System": st.column_config.TextColumn("Final System (editable)"),
+                "Confidence": st.column_config.NumberColumn("Confidence", format="%d%%"),
+                "Name Score": st.column_config.NumberColumn("Name Score", format="%d%%"),
+                "Value Score": st.column_config.NumberColumn("Value Score", format="%d%%"),
+            },
+            disabled=["Sheet Name", "Rows", "Cols", "Guessed System", "Confidence", "Name Score", "Value Score"],
+            use_container_width=True,
+            hide_index=True,
+            key="editor",
+        )
+
+        # merge edits back into the full classification table (edits apply only to filtered rows shown)
+        cdf = cdf.set_index("Sheet Name")
+        cdf.update(edited.set_index("Sheet Name")[["Final System"]])
+        cdf = cdf.reset_index()
+        st.session_state["classification_df"] = cdf
+
+        st.download_button(
+            "Download full classification (xlsx)",
+            data=to_excel_bytes(cdf),
+            file_name="tab_classification.xlsx",
+        )
+
+        st.divider()
+        st.subheader("4. Discover candidate edges")
+        st.write("Tabs sharing the same Final System are combined into one dataset per system before matching.")
+
+        confirmed = cdf[~cdf["Final System"].isin(["Skip", "", None])]
+        system_dfs = {}
+        for system, group in confirmed.groupby("Final System"):
+            frames = [raw_sheets[n] for n in group["Sheet Name"] if n in raw_sheets]
+            if frames:
+                system_dfs[system] = pd.concat(frames, ignore_index=True, sort=False)
+
+        st.write(f"Systems ready for lineage matching: {list(system_dfs.keys())}")
+
+        if st.button("Run discovery", type="primary", disabled=len(system_dfs) < 2):
+            st.session_state["report"] = pairwise_overlap_report(
+                system_dfs, header_threshold, match_value_threshold, min_matched_fields
+            )
+            st.session_state["dfs"] = system_dfs
+
+        if len(system_dfs) < 2:
+            st.info("Assign at least 2 systems (not Skip) to run discovery.")
+
+        if "report" in st.session_state:
+            report = st.session_state["report"]
+            st.dataframe(
+                report.style.apply(
+                    lambda row: ["background-color: #d4f7d4" if row["Candidate Edge"] else "" for _ in row],
+                    axis=1,
+                ),
+                use_container_width=True,
+            )
+            st.download_button(
+                "Download edge discovery report (xlsx)",
+                data=to_excel_bytes(report),
+                file_name="lineage_edge_discovery.xlsx",
+            )
+
+            st.divider()
+            st.subheader("5. Field-level mapping for a confirmed pair")
+
+            dfs = st.session_state["dfs"]
+            candidate_pairs = report[report["Candidate Edge"]] if not report.empty else report
+            pair_options = [f"{r['From']} -> {r['To']}" for _, r in candidate_pairs.iterrows()] or \
+                           [f"{r['From']} -> {r['To']}" for _, r in report.iterrows()]
+
+            selected_pair_tuple = None
+            if pair_options:
+                selected = st.selectbox("Choose a pair", pair_options)
+                from_sys, to_sys = selected.split(" -> ")
+
+                if st.button("Generate field-level mapping"):
+                    st.session_state["mapping_df"] = field_level_mapping(
+                        dfs[from_sys], dfs[to_sys], from_sys, to_sys,
+                        header_threshold, match_value_threshold,
+                    )
+                    st.session_state["mapping_pair"] = selected
+
+                if "mapping_df" in st.session_state:
+                    selected_pair_tuple = (from_sys, to_sys)
+                    st.write(f"**{st.session_state['mapping_pair']}**")
+                    mapping_df = st.session_state["mapping_df"]
+
+                    def highlight_row(row):
+                        return ["background-color: #fff3cd" for _ in row] if row["Adjustment Type"] else ["" for _ in row]
+
+                    st.dataframe(mapping_df.style.apply(highlight_row, axis=1), use_container_width=True)
+                    st.download_button(
+                        "Download field mapping (xlsx)",
+                        data=to_excel_bytes(mapping_df),
+                        file_name=f"lineage_mapping_{from_sys}_to_{to_sys}.xlsx",
+                    )
+                    n_adj = (mapping_df["Adjustment Type"] != "").sum()
+                    st.caption(
+                        f"{len(mapping_df) - n_adj} matched fields, {n_adj} unmatched target fields "
+                        f"flagged as candidate adjustments/manual entries - confirm these on the SME call."
+                    )
+
+            st.divider()
+            st.subheader("6. Lineage diagram")
+            st.write(
+                "Green = high confidence (80%+), amber = medium (60-79%), red = weak (below 60%). "
+                "Selected pair above is drawn thicker."
+            )
+            dot_source = build_lineage_diagram(report, confirmed_pair=selected_pair_tuple)
+            st.graphviz_chart(dot_source, use_container_width=True)
+            st.download_button(
+                "Download diagram source (.dot)",
+                data=dot_source,
+                file_name="lineage_diagram.dot",
+            )
+else:
+    st.info("Upload your workpaper Excel file to get started.")
