@@ -1,0 +1,260 @@
+"""
+End-to-end lineage discovery: ERP sources -> ... -> filing schedule
+
+This does NOT assume a fixed hop order. It treats every extract as a node,
+tests every pair of nodes for field/value overlap, and surfaces the
+strongest candidate edges. That's the right approach here because you
+don't yet know where DTTU sits, and you know ERS feeds Corptax directly
+(bypassing Longview) -- so the real structure is a graph, not a chain.
+
+Workflow:
+    1. Drop your extract files in EXTRACT_FILES below (one per system/tool).
+    2. Run pairwise_overlap_report() to get a ranked list of likely edges.
+    3. Run field_level_mapping() on the pairs you confirm are real edges,
+       to get the actual Source Field -> Target Field rows for your log.
+    4. Anything ambiguous (like DTTU) gets flagged for the SME call instead
+       of silently guessed.
+"""
+
+import itertools
+import pandas as pd
+from rapidfuzz import fuzz
+
+
+# ---------------------------------------------------------------------------
+# 1. CONFIG -- point this at your actual extract files
+# ---------------------------------------------------------------------------
+
+EXTRACT_FILES = {
+    "SAP_TB":     "sap_tb_extract.xlsx",
+    "ERS":        "ers_extract.xlsx",
+    "DTTU":       "dttu_output.xlsx",
+    "Longview":   "longview_upload_template.xlsx",
+    "Corptax":    "corptax_import.xlsx",
+    "Filing":     "filing_schedule.xlsx",
+}
+
+HEADER_MATCH_THRESHOLD = 80    # rapidfuzz score (0-100) to count as a name match
+VALUE_OVERLAP_THRESHOLD = 0.5  # fraction of shared unique values to count as a value match
+EDGE_MIN_MATCHED_FIELDS = 2    # min matched fields for a node pair to be a "candidate edge"
+
+
+def load_extracts(file_map: dict) -> dict:
+    """Load every extract into a dict of DataFrames, keyed by system name."""
+    dfs = {}
+    for system, path in file_map.items():
+        try:
+            dfs[system] = pd.read_excel(path) if path.endswith((".xlsx", ".xls")) else pd.read_csv(path)
+        except FileNotFoundError:
+            print(f"  [skip] {system}: file not found at {path}")
+    return dfs
+
+
+# ---------------------------------------------------------------------------
+# 2. HEADER (FIELD NAME) FUZZY MATCHING
+# ---------------------------------------------------------------------------
+
+def match_headers(df_a: pd.DataFrame, df_b: pd.DataFrame, threshold: int = HEADER_MATCH_THRESHOLD):
+    """
+    Fuzzy-match column names between two extracts.
+    Uses token_sort_ratio (handles reordered words, e.g. 'Account GL' vs 'GL Account')
+    and partial_ratio (handles truncation/prefixes common in SAP field names)
+    and keeps the max of the two per candidate pair.
+
+    Returns list of dicts: {source_field, target_field, score, method}
+    """
+    matches = []
+    used_targets = set()
+
+    for col_a in df_a.columns:
+        best_score, best_col_b, best_method = 0, None, None
+        for col_b in df_b.columns:
+            if col_b in used_targets:
+                continue
+            sort_score = fuzz.token_sort_ratio(str(col_a), str(col_b))
+            partial_score = fuzz.partial_ratio(str(col_a), str(col_b))
+            score, method = max((sort_score, "token_sort"), (partial_score, "partial"))
+            if score > best_score:
+                best_score, best_col_b, best_method = score, col_b, method
+
+        if best_score >= threshold:
+            matches.append({
+                "source_field": col_a,
+                "target_field": best_col_b,
+                "score": best_score,
+                "method": f"name:{best_method}",
+            })
+            used_targets.add(best_col_b)
+
+    return matches
+
+
+# ---------------------------------------------------------------------------
+# 3. VALUE-OVERLAP MATCHING (catches fields that were renamed with no
+#    name similarity at all -- very common between SAP and Longview)
+# ---------------------------------------------------------------------------
+
+def value_overlap_score(series_a: pd.Series, series_b: pd.Series) -> float:
+    """
+    Jaccard-style overlap of unique values between two columns.
+    Works best on categorical/code-like fields (entity codes, GL accounts,
+    cost centers) -- less meaningful on free-text or continuous amount fields,
+    so pair this with dtype compatibility checks.
+    """
+    set_a = set(series_a.dropna().astype(str).str.strip().str.upper())
+    set_b = set(series_b.dropna().astype(str).str.strip().str.upper())
+    if not set_a or not set_b:
+        return 0.0
+    intersection = len(set_a & set_b)
+    smaller = min(len(set_a), len(set_b))
+    return intersection / smaller if smaller else 0.0
+
+
+def match_by_values(df_a: pd.DataFrame, df_b: pd.DataFrame,
+                     already_matched_targets: set,
+                     threshold: float = VALUE_OVERLAP_THRESHOLD):
+    """
+    For fields that didn't match by name, check whether their underlying
+    values overlap heavily -- that's a strong signal they're the same field
+    even with a completely different header (e.g. 'WERKS' -> 'Entity_Code').
+    """
+    matches = []
+    used_targets = set(already_matched_targets)
+
+    for col_a in df_a.columns:
+        best_score, best_col_b = 0.0, None
+        for col_b in df_b.columns:
+            if col_b in used_targets:
+                continue
+            # cheap dtype pre-filter: only compare similarly-typed columns
+            if df_a[col_a].dtype.kind not in "OUS" and df_b[col_b].dtype.kind in "OUS":
+                continue
+            score = value_overlap_score(df_a[col_a], df_b[col_b])
+            if score > best_score:
+                best_score, best_col_b = score, col_b
+
+        if best_score >= threshold:
+            matches.append({
+                "source_field": col_a,
+                "target_field": best_col_b,
+                "score": round(best_score * 100, 1),
+                "method": "value_overlap",
+            })
+            used_targets.add(best_col_b)
+
+    return matches
+
+
+# ---------------------------------------------------------------------------
+# 4. FULL FIELD-LEVEL MAPPING FOR A CONFIRMED PAIR
+# ---------------------------------------------------------------------------
+
+def field_level_mapping(df_a: pd.DataFrame, df_b: pd.DataFrame,
+                         source_system: str, target_system: str) -> pd.DataFrame:
+    """
+    Run header matching first, then fall back to value-overlap matching
+    for anything still unmatched. Fields in target with no match at all
+    are logged as candidate Adjustments (present in target, no source
+    counterpart -- typical of manual entries, eliminations, true-ups).
+    """
+    header_matches = match_headers(df_a, df_b)
+    matched_targets = {m["target_field"] for m in header_matches}
+
+    value_matches = match_by_values(df_a, df_b, matched_targets)
+    all_matches = header_matches + value_matches
+    matched_targets |= {m["target_field"] for m in value_matches}
+
+    rows = []
+    for m in all_matches:
+        rows.append({
+            "Source System": source_system,
+            "Source Field": m["source_field"],
+            "Transformation": "direct" if m["score"] >= 95 else "mapped/renamed",
+            "Target System": target_system,
+            "Target Field": m["target_field"],
+            "Adjustment Type": "",
+            "Match Confidence": m["score"],
+            "Match Method": m["method"],
+            "SME Confirmed": "Pending",
+        })
+
+    # unmatched target fields = candidate adjustments / manual entries
+    for col_b in df_b.columns:
+        if col_b not in matched_targets:
+            rows.append({
+                "Source System": "(none found)",
+                "Source Field": "",
+                "Transformation": "manual/adjustment - unverified",
+                "Target System": target_system,
+                "Target Field": col_b,
+                "Adjustment Type": "Candidate M-1/M-3 or manual entry - CONFIRM WITH SME",
+                "Match Confidence": 0,
+                "Match Method": "no_match",
+                "SME Confirmed": "Pending",
+            })
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# 5. GRAPH DISCOVERY -- test every node pair, rank candidate edges
+# ---------------------------------------------------------------------------
+
+def pairwise_overlap_report(dfs: dict) -> pd.DataFrame:
+    """
+    Tests every pair of extracts (in both directions, since you don't know
+    flow direction yet) and scores how strongly they look connected.
+    This is what tells you, e.g., whether DTTU looks more connected to
+    Corptax or to the provision workpapers, without assuming an answer.
+    """
+    results = []
+    systems = list(dfs.keys())
+
+    for sys_a, sys_b in itertools.permutations(systems, 2):
+        df_a, df_b = dfs[sys_a], dfs[sys_b]
+        header_matches = match_headers(df_a, df_b)
+        matched_targets = {m["target_field"] for m in header_matches}
+        value_matches = match_by_values(df_a, df_b, matched_targets)
+
+        total_matches = len(header_matches) + len(value_matches)
+        avg_conf = (
+            sum(m["score"] for m in header_matches + value_matches) / total_matches
+            if total_matches else 0
+        )
+
+        results.append({
+            "From": sys_a,
+            "To": sys_b,
+            "Matched Fields": total_matches,
+            "Avg Confidence": round(avg_conf, 1),
+            "Candidate Edge": total_matches >= EDGE_MIN_MATCHED_FIELDS,
+        })
+
+    report = pd.DataFrame(results).sort_values(
+        ["Candidate Edge", "Matched Fields"], ascending=[False, False]
+    )
+    return report.reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# 6. RUN
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    print("Loading extracts...")
+    dfs = load_extracts(EXTRACT_FILES)
+    print(f"Loaded: {list(dfs.keys())}\n")
+
+    print("Running pairwise overlap discovery (this replaces guessing hop order)...")
+    overlap_report = pairwise_overlap_report(dfs)
+    overlap_report.to_excel("lineage_edge_discovery.xlsx", index=False)
+    print(overlap_report[overlap_report["Candidate Edge"]].to_string(index=False))
+    print("\nFull report saved to lineage_edge_discovery.xlsx")
+    print("-> Rows marked Candidate Edge=True are your likely real connections.")
+    print("-> For DTTU specifically: check its rows against BOTH Corptax and any")
+    print("   provision/workpaper file. Whichever has higher Matched Fields / Avg")
+    print("   Confidence is your best guess -- confirm on the SME call either way.")
+
+    print("\nOnce you've confirmed real edges, call field_level_mapping(df_a, df_b,")
+    print("'SystemA', 'SystemB') on each confirmed pair to build your actual")
+    print("Source/Target lineage log rows, then concat them all together.")
