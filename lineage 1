@@ -1,13 +1,14 @@
 """
-Streamlit dashboard for end-to-end lineage discovery
-(ERP sources -> DTTU / Longview / ERS -> Corptax -> filing schedule)
+Streamlit dashboard for end-to-end lineage discovery -- single workpaper version.
+
+Accepts ONE Excel workbook containing multiple tabs (SAP TB, Corptax, Longview,
+ERS, DTTU, filing schedule, etc.), auto-identifies which tab is which system
+from the sheet name (and column signatures as a fallback), lets you confirm
+or override each guess, then runs the same overlap discovery + field mapping
+as before across the confirmed tabs.
 
 Run with:
     streamlit run lineage_dashboard.py
-
-Upload each system's extract file, run discovery to see which systems
-are actually connected (and how strongly), then drill into any confirmed
-pair to get the field-level Source/Target mapping log.
 """
 
 import itertools
@@ -19,15 +20,68 @@ from rapidfuzz import fuzz
 
 
 # ---------------------------------------------------------------------------
-# CORE MATCHING LOGIC (same as lineage_discovery.py)
+# TAB IDENTIFICATION -- guess system from sheet name + column signatures
 # ---------------------------------------------------------------------------
 
-def read_any(uploaded_file) -> pd.DataFrame:
-    name = uploaded_file.name.lower()
-    if name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(uploaded_file)
-    return pd.read_csv(uploaded_file)
+# Aliases used to fuzzy-match sheet names to a system label.
+SYSTEM_ALIASES = {
+    "SAP_TB":   ["sap", "tb", "trial balance", "sap tb", "gl extract", "sap extract"],
+    "ERS":      ["ers", "estimated return summary", "ers extract"],
+    "DTTU":     ["dttu", "deferred tax true up", "deferred tax true-up", "true up", "true-up", "dtt"],
+    "Longview": ["longview", "lv", "lv upload", "upload template", "consolidation"],
+    "Corptax":  ["corptax", "corp tax", "ctx", "corptax import"],
+    "Filing":   ["filing", "return", "schedule", "tax return", "filed"],
+}
 
+# Column-name keywords that are typical signatures of each system, used as a
+# fallback/confidence-booster when the sheet name itself is ambiguous
+# (e.g. tabs named "Sheet1", "Data", "Tab3").
+SYSTEM_COLUMN_SIGNATURES = {
+    "SAP_TB":   ["company code", "gl account", "cost center", "werks", "doc type", "posting"],
+    "ERS":      ["entity id", "return type", "estimate", "ers"],
+    "DTTU":     ["true up", "true-up", "deferred tax", "dtl", "dta", "temporary difference"],
+    "Longview": ["consolidation", "adjustment code", "elimination", "reporting entity"],
+    "Corptax":  ["tax year", "entity", "m-1", "m-3", "schedule", "federal taxable"],
+    "Filing":   ["form", "line item", "filed amount", "jurisdiction"],
+}
+
+
+def guess_system_for_sheet(sheet_name: str, df: pd.DataFrame):
+    """
+    Returns (best_system, confidence 0-100, reason string).
+    Combines sheet-name fuzzy match with a column-keyword vote.
+    """
+    name_scores = {}
+    for system, aliases in SYSTEM_ALIASES.items():
+        best = max(fuzz.partial_ratio(sheet_name.lower(), a) for a in aliases)
+        name_scores[system] = best
+
+    best_name_system = max(name_scores, key=name_scores.get)
+    best_name_score = name_scores[best_name_system]
+
+    cols_lower = " | ".join(str(c).lower() for c in df.columns)
+    col_scores = {}
+    for system, keywords in SYSTEM_COLUMN_SIGNATURES.items():
+        hits = sum(1 for kw in keywords if kw in cols_lower)
+        col_scores[system] = hits
+
+    best_col_system = max(col_scores, key=col_scores.get)
+    best_col_hits = col_scores[best_col_system]
+
+    if best_name_score >= 70:
+        return best_name_system, best_name_score, f"sheet name matched '{sheet_name}'"
+    elif best_col_hits >= 2:
+        confidence = min(50 + best_col_hits * 10, 90)
+        return best_col_system, confidence, f"{best_col_hits} column keywords matched"
+    elif best_name_score >= 40:
+        return best_name_system, best_name_score, f"weak sheet-name match on '{sheet_name}'"
+    else:
+        return "Unassigned", 0, "no strong signal -- assign manually"
+
+
+# ---------------------------------------------------------------------------
+# CORE MATCHING LOGIC (unchanged from prior version)
+# ---------------------------------------------------------------------------
 
 def match_headers(df_a: pd.DataFrame, df_b: pd.DataFrame, threshold: int):
     matches = []
@@ -149,7 +203,7 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 st.set_page_config(page_title="Lineage Discovery", layout="wide")
 st.title("End-to-End Lineage Discovery")
-st.caption("ERP sources → DTTU / Longview / ERS → Corptax → filing schedule — inferred from extracts, not live system access.")
+st.caption("Upload one workpaper (multiple tabs) → auto-identify each tab's system → discover connections → build the field-level mapping log.")
 
 with st.sidebar:
     st.header("Matching sensitivity")
@@ -157,93 +211,107 @@ with st.sidebar:
     value_threshold = st.slider("Value overlap threshold", 0.0, 1.0, 0.5, 0.05)
     min_matched_fields = st.slider("Min matched fields to call it a candidate edge", 1, 10, 2)
 
-st.subheader("1. Upload extracts")
-st.write("Upload one file per system. Name each one after the system it represents (SAP, ERS, DTTU, Longview, Corptax, Filing, etc.) — you decide the labels, so unknown-flow systems like DTTU are just another node.")
+st.subheader("1. Upload your workpaper")
+workpaper = st.file_uploader("Excel workbook with one tab per system", type=["xlsx", "xls"])
 
-if "systems" not in st.session_state:
-    st.session_state.systems = ["SAP_TB", "ERS", "DTTU", "Longview", "Corptax", "Filing"]
+if workpaper is not None:
+    raw_sheets = pd.read_excel(workpaper, sheet_name=None)  # dict: {sheet_name: df}
+    st.success(f"Found {len(raw_sheets)} tabs: {list(raw_sheets.keys())}")
 
-cols = st.columns(3)
-dfs = {}
-for i, system in enumerate(st.session_state.systems):
-    with cols[i % 3]:
-        uploaded = st.file_uploader(system, type=["csv", "xlsx", "xls"], key=f"upload_{system}")
-        if uploaded is not None:
-            try:
-                dfs[system] = read_any(uploaded)
-                st.success(f"{len(dfs[system])} rows, {len(dfs[system].columns)} columns")
-            except Exception as e:
-                st.error(f"Could not read {system}: {e}")
+    st.subheader("2. Confirm which tab is which system")
+    st.write("Best guess is pre-filled from the sheet name and column contents. Override anything that's wrong, and set unrelated tabs (notes, cover sheets) to *Skip*.")
 
-new_system = st.text_input("Add another system/tool (optional)", "")
-if st.button("Add system") and new_system.strip():
-    st.session_state.systems.append(new_system.strip())
-    st.rerun()
+    system_options = list(SYSTEM_ALIASES.keys()) + ["Skip", "Other (type below)"]
+    assignments = {}
 
-st.divider()
-st.subheader("2. Discover candidate edges")
-st.write("Tests every pair of uploaded systems for field/value overlap. Doesn't assume a fixed hop order — this is what tells you where an ambiguous system like DTTU actually connects.")
+    for sheet_name, df in raw_sheets.items():
+        guess, confidence, reason = guess_system_for_sheet(sheet_name, df)
+        default_idx = system_options.index(guess) if guess in system_options else system_options.index("Skip")
 
-if st.button("Run discovery", type="primary", disabled=len(dfs) < 2):
-    report = pairwise_overlap_report(dfs, header_threshold, value_threshold, min_matched_fields)
-    st.session_state["report"] = report
+        col1, col2, col3 = st.columns([2, 2, 3])
+        with col1:
+            st.markdown(f"**{sheet_name}**")
+            st.caption(f"{len(df)} rows x {len(df.columns)} cols")
+        with col2:
+            choice = st.selectbox(
+                "System", system_options, index=default_idx,
+                key=f"assign_{sheet_name}", label_visibility="collapsed",
+            )
+        with col3:
+            st.caption(f"Guess: {guess} ({confidence:.0f}% - {reason})")
 
-if len(dfs) < 2:
-    st.info("Upload at least 2 files to run discovery.")
-
-if "report" in st.session_state:
-    report = st.session_state["report"]
-    st.dataframe(
-        report.style.apply(
-            lambda row: ["background-color: #d4f7d4" if row["Candidate Edge"] else "" for _ in row],
-            axis=1,
-        ),
-        use_container_width=True,
-    )
-    st.download_button(
-        "Download edge discovery report (xlsx)",
-        data=to_excel_bytes(report),
-        file_name="lineage_edge_discovery.xlsx",
-    )
+        if choice == "Other (type below)":
+            custom = st.text_input(f"Custom label for '{sheet_name}'", key=f"custom_{sheet_name}")
+            if custom.strip():
+                assignments[custom.strip()] = df
+        elif choice != "Skip":
+            assignments[choice] = df
 
     st.divider()
-    st.subheader("3. Field-level mapping for a confirmed pair")
-    st.write("Once you've confirmed a real edge (on the SME call or from strong scores above), pick the pair here to generate the actual Source/Target field log.")
+    st.subheader("3. Discover candidate edges")
+    st.write(f"Confirmed tabs: {list(assignments.keys()) if assignments else 'none yet'}")
 
-    candidate_pairs = report[report["Candidate Edge"]] if not report.empty else report
-    pair_options = [f"{r['From']} → {r['To']}" for _, r in candidate_pairs.iterrows()] or \
-                   [f"{r['From']} → {r['To']}" for _, r in report.iterrows()]
+    if st.button("Run discovery", type="primary", disabled=len(assignments) < 2):
+        st.session_state["report"] = pairwise_overlap_report(
+            assignments, header_threshold, value_threshold, min_matched_fields
+        )
+        st.session_state["dfs"] = assignments
 
-    if pair_options:
-        selected = st.selectbox("Choose a pair", pair_options)
-        from_sys, to_sys = selected.split(" → ")
+    if len(assignments) < 2:
+        st.info("Confirm at least 2 tabs to a system (not Skip) to run discovery.")
 
-        if st.button("Generate field-level mapping"):
-            mapping_df = field_level_mapping(
-                dfs[from_sys], dfs[to_sys], from_sys, to_sys,
-                header_threshold, value_threshold,
-            )
-            st.session_state["mapping_df"] = mapping_df
-            st.session_state["mapping_pair"] = selected
+    if "report" in st.session_state:
+        report = st.session_state["report"]
+        st.dataframe(
+            report.style.apply(
+                lambda row: ["background-color: #d4f7d4" if row["Candidate Edge"] else "" for _ in row],
+                axis=1,
+            ),
+            use_container_width=True,
+        )
+        st.download_button(
+            "Download edge discovery report (xlsx)",
+            data=to_excel_bytes(report),
+            file_name="lineage_edge_discovery.xlsx",
+        )
 
-        if "mapping_df" in st.session_state:
-            st.write(f"**{st.session_state['mapping_pair']}**")
-            mapping_df = st.session_state["mapping_df"]
+        st.divider()
+        st.subheader("4. Field-level mapping for a confirmed pair")
 
-            def highlight_row(row):
-                if row["Adjustment Type"]:
-                    return ["background-color: #fff3cd" for _ in row]
-                return ["" for _ in row]
+        dfs = st.session_state["dfs"]
+        candidate_pairs = report[report["Candidate Edge"]] if not report.empty else report
+        pair_options = [f"{r['From']} -> {r['To']}" for _, r in candidate_pairs.iterrows()] or \
+                       [f"{r['From']} -> {r['To']}" for _, r in report.iterrows()]
 
-            st.dataframe(mapping_df.style.apply(highlight_row, axis=1), use_container_width=True)
-            st.download_button(
-                "Download field mapping (xlsx)",
-                data=to_excel_bytes(mapping_df),
-                file_name=f"lineage_mapping_{from_sys}_to_{to_sys}.xlsx",
-            )
+        if pair_options:
+            selected = st.selectbox("Choose a pair", pair_options)
+            from_sys, to_sys = selected.split(" -> ")
 
-            n_adj = (mapping_df["Adjustment Type"] != "").sum()
-            st.caption(
-                f"{len(mapping_df) - n_adj} matched fields, {n_adj} unmatched target fields "
-                f"flagged as candidate adjustments/manual entries — confirm these specifically on the SME call."
-            )
+            if st.button("Generate field-level mapping"):
+                st.session_state["mapping_df"] = field_level_mapping(
+                    dfs[from_sys], dfs[to_sys], from_sys, to_sys,
+                    header_threshold, value_threshold,
+                )
+                st.session_state["mapping_pair"] = selected
+
+            if "mapping_df" in st.session_state:
+                st.write(f"**{st.session_state['mapping_pair']}**")
+                mapping_df = st.session_state["mapping_df"]
+
+                def highlight_row(row):
+                    return ["background-color: #fff3cd" for _ in row] if row["Adjustment Type"] else ["" for _ in row]
+
+                st.dataframe(mapping_df.style.apply(highlight_row, axis=1), use_container_width=True)
+                st.download_button(
+                    "Download field mapping (xlsx)",
+                    data=to_excel_bytes(mapping_df),
+                    file_name=f"lineage_mapping_{from_sys}_to_{to_sys}.xlsx",
+                )
+
+                n_adj = (mapping_df["Adjustment Type"] != "").sum()
+                st.caption(
+                    f"{len(mapping_df) - n_adj} matched fields, {n_adj} unmatched target fields "
+                    f"flagged as candidate adjustments/manual entries - confirm these on the SME call."
+                )
+else:
+    st.info("Upload your workpaper Excel file to get started.")
