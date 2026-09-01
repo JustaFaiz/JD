@@ -1,0 +1,799 @@
+"""
+filing_lineage_dashboard.py
+----------------------------
+Filing-centric lineage engine. You pick one sheet (e.g. "A_Taxable Income
+Summary") as the filing reference / root node, and the tool builds the
+lineage BACKWARD from it: every sheet that feeds it, directly or
+transitively, via real cross-sheet formulas or Excel named ranges -- with
+fuzzy description/value matching as a fallback for sheets no formula path
+reaches at all.
+
+Every node is classified purely by its position in the traced graph:
+    - Output node   = the root you picked
+    - Process node  = something feeds it, and it feeds something else
+    - Input source  = nothing (discoverable) feeds it
+
+Confidence is a fixed-tier ranking, not a blend -- the method that found
+a given edge determines its confidence outright:
+    1. Cell formula reference (direct cross-sheet formula)  -> 100%
+    2. Named range link (formula uses a workbook-defined name) -> 90%
+    3. Description similarity (fuzzy sheet name / row label match) -> 80%
+    4. Value overlap (shared unique values between columns)  -> 70%
+A sheet only enters the lineage if some method clears its tier's
+detection bar; below 70% overall, it's excluded rather than force-fit.
+
+Run with:
+    streamlit run filing_lineage_dashboard.py
+"""
+
+import io
+import os
+import re
+import json
+import tempfile
+import webbrowser
+
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter, column_index_from_string
+from rapidfuzz import fuzz
+
+try:
+    import streamlit as st
+except ImportError:
+    st = None  # allows importing this module's logic functions without Streamlit installed
+
+
+# ---------------------------------------------------------------------------
+# CONFIDENCE TIERS -- fixed by method, not blended
+# ---------------------------------------------------------------------------
+
+TIER_CONFIDENCE = {
+    "formula": 100,        # direct cross-sheet cell/range formula reference
+    "named_range": 90,     # formula uses a workbook-defined name resolving to another sheet
+    "description": 80,     # fuzzy sheet-name / row-label match
+    "value": 70,           # value-set overlap
+}
+CONFIDENCE_THRESHOLD = 70
+
+# Sheets named after a form line item (L10, L26, Line_15, "Line 20", etc.)
+# are calculation/support schedules, not raw data sources -- they're often
+# self-contained (manual entries, or math with no formula link to another
+# sheet), which would otherwise make "nothing feeds it" wrongly classify
+# them as Input source. This pattern overrides that: a name matching it
+# is treated as a Process node even with no discovered upstream feeder.
+# Adjustable per-workbook via the UI, since naming conventions vary.
+LINE_SCHEDULE_PATTERN_DEFAULT = r"^(l|line)[\s_\-]?\d+|^(sch|schedule)\b"
+
+
+def matches_line_schedule_pattern(sheet_name, pattern):
+    if not pattern:
+        return False
+    try:
+        return bool(re.match(pattern, sheet_name.strip(), re.IGNORECASE))
+    except re.error:
+        return False
+
+DESCRIPTION_DETECT_THRESHOLD = 55   # rapidfuzz score (0-100) to count as "a description match exists"
+VALUE_DETECT_THRESHOLD = 0.25       # Jaccard overlap fraction to count as "a value match exists"
+
+MAX_COLS_FOR_MATCHING = 15
+MAX_ROWS_FOR_VALUE_MATCH = 300
+MAX_ROWS_FOR_LABEL_SCAN = 500
+
+
+# ---------------------------------------------------------------------------
+# FORMULA PARSING -- cross-sheet cell/range references
+# (same approach as sheet_tree_server.py's extract_refs)
+# ---------------------------------------------------------------------------
+
+CELL_REF_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3}\$?\d{1,7})(?::(\$?[A-Z]{1,3}\$?\d{1,7}))?(?!\()"
+)
+COLUMN_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?([A-Z]{1,3})\$?:\$?([A-Z]{1,3})\$?(?![A-Za-z0-9_])"
+)
+ROW_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?(\d{1,7})\$?:\$?(\d{1,7})\$?(?![A-Za-z0-9_])"
+)
+# Bare identifier NOT immediately followed by "(" -- i.e. not a function call.
+# Used to spot references to Excel defined names (named ranges) inside formulas.
+NAME_TOKEN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_.]*)\b(?!\()")
+
+FULL_RANGE_ROW_CAP = 5000
+FULL_RANGE_COL_CAP = 200
+
+
+def extract_cross_sheet_refs(formula, current_sheet):
+    """Returns the set of OTHER sheet names directly referenced by this formula
+    via a standard cell/range/column/row reference (e.g. 'L20'!B12, or a
+    bare B12 meaning the current sheet -- excluded since it's not cross-sheet)."""
+    refs = set()
+    for m in CELL_REF_RE.finditer(formula):
+        sheet = m.group(1) or m.group(2)
+        if sheet and sheet != current_sheet:
+            refs.add(sheet)
+    for m in COLUMN_ONLY_RE.finditer(formula):
+        sheet = m.group(1) or m.group(2)
+        if sheet and sheet != current_sheet:
+            refs.add(sheet)
+    for m in ROW_ONLY_RE.finditer(formula):
+        sheet = m.group(1) or m.group(2)
+        if sheet and sheet != current_sheet:
+            refs.add(sheet)
+    return refs
+
+
+def extract_named_range_refs(formula, defined_name_map, current_sheet):
+    """
+    Scans a formula for bare identifiers that match a workbook-defined name
+    (Name Manager), and returns the set of OTHER sheets that name resolves
+    to. defined_name_map: {lowercase_name: set(sheet_names)}.
+    """
+    refs = set()
+    for m in NAME_TOKEN_RE.finditer(formula):
+        token = m.group(1).lower()
+        if token in defined_name_map:
+            for sheet in defined_name_map[token]:
+                if sheet != current_sheet:
+                    refs.add(sheet)
+    return refs
+
+
+def load_defined_name_map(wb):
+    """
+    Returns {lowercase_defined_name: set(sheet_names it resolves into)}.
+    Handles both workbook-level (wb.defined_names) and worksheet-scoped
+    names across openpyxl versions.
+    """
+    name_map = {}
+
+    def add_destinations(name_obj, name_key):
+        try:
+            for sheet_name, _coord in name_obj.destinations:
+                name_map.setdefault(name_key, set()).add(sheet_name)
+        except Exception:
+            pass
+
+    try:
+        for name_key, name_obj in wb.defined_names.items():
+            add_destinations(name_obj, name_key.lower())
+    except AttributeError:
+        # very old openpyxl: defined_names might be a plain list
+        for name_obj in getattr(wb, "defined_names", []):
+            add_destinations(name_obj, getattr(name_obj, "name", "").lower())
+
+    for ws in wb.worksheets:
+        local_names = getattr(ws, "defined_names", None)
+        if not local_names:
+            continue
+        try:
+            for name_key, name_obj in local_names.items():
+                add_destinations(name_obj, name_key.lower())
+        except AttributeError:
+            pass
+
+    return name_map
+
+
+def load_workbook_formulas(file_bytes):
+    """
+    Reads every formula in the workbook once. Returns:
+        formulas: {(sheet, coord): formula_string}
+        sheetnames: [str]
+        defined_name_map: {lowercase_name: set(sheet_names)}
+    """
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=False, read_only=False)
+    defined_name_map = load_defined_name_map(wb)
+
+    formulas = {}
+    for ws in wb.worksheets:
+        max_row = ws.max_row or 1
+        max_col = ws.max_column or 1
+        for r_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col), start=1):
+            for c_idx, cell in enumerate(row, start=1):
+                if isinstance(cell.value, str) and cell.value.startswith("="):
+                    coord = f"{get_column_letter(c_idx)}{r_idx}"
+                    formulas[(ws.title, coord)] = cell.value
+    sheetnames = wb.sheetnames
+    wb.close()
+    return formulas, sheetnames, defined_name_map
+
+
+# ---------------------------------------------------------------------------
+# BACKWARD TRAVERSAL FROM THE ROOT
+# ---------------------------------------------------------------------------
+
+def trace_lineage_from_root(root_sheet, formulas, defined_name_map):
+    """
+    BFS backward from root_sheet along real formula references. An edge
+    (src -> dst) means "src feeds dst". Returns:
+        edges: {(src, dst): {"tier": "formula"|"named_range", "confidence": int}}
+        visited: set of sheet names reached (includes root_sheet)
+
+    Tie-break: if a (src, dst) pair is found via BOTH a direct formula ref
+    and a named-range ref, the direct formula (higher tier) wins.
+    """
+    edges = {}
+    visited = {root_sheet}
+    frontier = [root_sheet]
+
+    # index formulas by sheet for fast lookup
+    formulas_by_sheet = {}
+    for (sheet, coord), f in formulas.items():
+        formulas_by_sheet.setdefault(sheet, []).append(f)
+
+    while frontier:
+        next_frontier = []
+        for current in frontier:
+            for f in formulas_by_sheet.get(current, []):
+                direct_refs = extract_cross_sheet_refs(f, current)
+                named_refs = extract_named_range_refs(f, defined_name_map, current) - direct_refs
+
+                for src in direct_refs:
+                    key = (src, current)
+                    if key not in edges or edges[key]["tier"] != "formula":
+                        edges[key] = {"tier": "formula", "confidence": TIER_CONFIDENCE["formula"]}
+                    if src not in visited:
+                        visited.add(src)
+                        next_frontier.append(src)
+
+                for src in named_refs:
+                    key = (src, current)
+                    if key not in edges:
+                        edges[key] = {"tier": "named_range", "confidence": TIER_CONFIDENCE["named_range"]}
+                    if src not in visited:
+                        visited.add(src)
+                        next_frontier.append(src)
+        frontier = next_frontier
+
+    return edges, visited
+
+
+# ---------------------------------------------------------------------------
+# FALLBACK: description similarity + value overlap for unreached sheets
+# ---------------------------------------------------------------------------
+
+def build_text_pool(df, sheet_name, max_rows=MAX_ROWS_FOR_LABEL_SCAN):
+    """Sheet name + up to max_rows of text-like cell values (row labels), for description matching."""
+    pool = [sheet_name]
+    for col in df.columns[:MAX_COLS_FOR_MATCHING]:
+        series = df[col].dropna().astype(str).head(max_rows)
+        pool.extend(v for v in series if not v.replace(".", "", 1).replace("-", "", 1).isdigit())
+    return pool
+
+
+def description_similarity(pool_a, pool_b):
+    """Best pairwise fuzzy match between two text pools, 0-100."""
+    if not pool_a or not pool_b:
+        return 0.0
+    best = 0.0
+    # cap comparisons for speed on large pools
+    for a in pool_a[:60]:
+        for b in pool_b[:60]:
+            score = fuzz.token_sort_ratio(str(a), str(b))
+            if score > best:
+                best = score
+    return best
+
+
+def value_overlap_score(series_a: pd.Series, series_b: pd.Series) -> float:
+    set_a = set(series_a.dropna().astype(str).str.strip().str.upper())
+    set_b = set(series_b.dropna().astype(str).str.strip().str.upper())
+    if not set_a or not set_b:
+        return 0.0
+    smaller = min(len(set_a), len(set_b))
+    return (len(set_a & set_b) / smaller) if smaller else 0.0
+
+
+def value_similarity(df_a, df_b):
+    """Average best per-column Jaccard overlap between two sheets, 0-1."""
+    cols_a = list(df_a.columns)[:MAX_COLS_FOR_MATCHING]
+    cols_b = list(df_b.columns)[:MAX_COLS_FOR_MATCHING]
+    if not cols_a or not cols_b:
+        return 0.0
+    sample_a = df_a[cols_a].head(MAX_ROWS_FOR_VALUE_MATCH)
+    sample_b = df_b[cols_b].head(MAX_ROWS_FOR_VALUE_MATCH)
+    scores = []
+    for ca in cols_a:
+        best = 0.0
+        for cb in cols_b:
+            try:
+                s = value_overlap_score(sample_a[ca], sample_b[cb])
+            except Exception:
+                s = 0.0
+            best = max(best, s)
+        scores.append(best)
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def fallback_match_unreached_sheets(unmapped_sheets, lineage_sheets, raw_sheets):
+    """
+    For every sheet no formula path reached, tries description similarity
+    first, then value overlap, against every sheet already in the lineage.
+    Picks the single best-scoring candidate parent per method; if description
+    clears its detection bar, that wins outright (higher tier) without even
+    checking value overlap for that sheet.
+
+    Returns {sheet_name: {"parent": str, "tier": str, "confidence": int}}
+    for sheets that clear CONFIDENCE_THRESHOLD; sheets that don't clear
+    either bar are simply absent (excluded from the lineage).
+    """
+    results = {}
+    text_pools = {s: build_text_pool(raw_sheets[s], s) for s in lineage_sheets if s in raw_sheets}
+
+    for sheet in unmapped_sheets:
+        if sheet not in raw_sheets:
+            continue
+        df = raw_sheets[sheet]
+        pool = build_text_pool(df, sheet)
+
+        best_desc_score, best_desc_parent = 0.0, None
+        for parent in lineage_sheets:
+            if parent not in text_pools:
+                continue
+            score = description_similarity(pool, text_pools[parent])
+            if score > best_desc_score:
+                best_desc_score, best_desc_parent = score, parent
+
+        if best_desc_score >= DESCRIPTION_DETECT_THRESHOLD:
+            results[sheet] = {
+                "parent": best_desc_parent, "tier": "description",
+                "confidence": TIER_CONFIDENCE["description"],
+            }
+            continue
+
+        best_val_score, best_val_parent = 0.0, None
+        for parent in lineage_sheets:
+            if parent not in raw_sheets:
+                continue
+            score = value_similarity(df, raw_sheets[parent])
+            if score > best_val_score:
+                best_val_score, best_val_parent = score, parent
+
+        if best_val_score >= VALUE_DETECT_THRESHOLD:
+            results[sheet] = {
+                "parent": best_val_parent, "tier": "value",
+                "confidence": TIER_CONFIDENCE["value"],
+            }
+
+    return {k: v for k, v in results.items() if v["confidence"] >= CONFIDENCE_THRESHOLD}
+
+
+# ---------------------------------------------------------------------------
+# LINE 30 / TAXABLE INCOME AUTO-DETECTION
+# ---------------------------------------------------------------------------
+
+LINE30_LABEL_HINTS = ["taxable income", "line 30", "net taxable income"]
+
+CELL_ADDR_RE = re.compile(r"^\$?([A-Za-z]{1,3})\$?(\d{1,7})$")
+
+
+def lookup_cell_direct(file_bytes, sheet_name, cell_ref):
+    """
+    Looks up an exact cell you specify (e.g. "B30") and returns
+    (row_index, column_letter, nearby_label, value, formula) for
+    confirmation -- reads the row's leftmost text cell (column A by
+    default) as the likely label, and the cell's own computed value via
+    data_only=True, so you can visually confirm it's the right one before
+    it's used. Returns None if the reference doesn't parse or the sheet
+    is missing.
+
+    Note: data_only=True only returns a value if the workbook was last
+    saved by actual Excel (it reads Excel's cached formula result, not a
+    live recalculation) -- a workbook resaved purely through openpyxl
+    will show None for a formula cell even though the formula itself is
+    fine. The caller surfaces this distinction rather than just showing
+    a blank value.
+    """
+    m = CELL_ADDR_RE.match(cell_ref.strip())
+    if not m:
+        return None
+    col_letters, row_str = m.group(1).upper(), m.group(2)
+    row_idx = int(row_str)
+    try:
+        col_idx = column_index_from_string(col_letters)
+    except ValueError:
+        return None
+
+    wb_values = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    if sheet_name not in wb_values.sheetnames:
+        wb_values.close()
+        return None
+    ws_values = wb_values[sheet_name]
+    value = ws_values.cell(row=row_idx, column=col_idx).value
+    label = ws_values.cell(row=row_idx, column=1).value
+    wb_values.close()
+
+    wb_formulas = load_workbook(io.BytesIO(file_bytes), data_only=False, read_only=True)
+    ws_formulas = wb_formulas[sheet_name]
+    raw = ws_formulas.cell(row=row_idx, column=col_idx).value
+    formula = raw if isinstance(raw, str) and raw.startswith("=") else None
+    wb_formulas.close()
+
+    return {"row": row_idx, "col": col_letters, "label": label, "value": value, "formula": formula}
+
+
+def detect_final_output_cell(df, target_row_hint=30):
+    """
+    Scans the root sheet's rows for a label fuzzy-matching a taxable-income
+    hint, weighted toward rows near target_row_hint. Returns a ranked list
+    of (row_index, column, cell_text, score) candidates -- caller/user picks
+    or confirms, this doesn't blindly commit to the top guess.
+    """
+    candidates = []
+    for col in df.columns[:5]:  # label columns are almost always leftmost
+        series = df[col].dropna().astype(str)
+        for row_idx, text in series.items():
+            best_hint_score = max(fuzz.partial_ratio(text.lower(), hint) for hint in LINE30_LABEL_HINTS)
+            if best_hint_score < 60:
+                continue
+            row_distance_penalty = min(abs((row_idx + 2) - target_row_hint), 20)  # +2 for header offset guess
+            adjusted_score = best_hint_score - row_distance_penalty
+            candidates.append((row_idx, col, text, round(adjusted_score, 1)))
+    candidates.sort(key=lambda c: c[3], reverse=True)
+    return candidates[:10]
+
+
+# ---------------------------------------------------------------------------
+# CLASSIFICATION + ASSEMBLY
+# ---------------------------------------------------------------------------
+
+def classify_and_assemble(root_sheet, traced_edges, fallback_edges, final_output_desc,
+                           line_schedule_pattern=LINE_SCHEDULE_PATTERN_DEFAULT):
+    """
+    Builds the final node list + relationship list. Classification is
+    decided ONLY from traced_edges (real formula/named-range evidence) --
+    fallback edges are excluded from that decision on purpose. Otherwise a
+    fuzzy-matched sheet pointing at a genuinely formula-confirmed Input
+    source would wrongly downgrade it to a Process node just because
+    something resembles it.
+
+    A sheet with no discovered feeder is Input source UNLESS its name
+    matches line_schedule_pattern (e.g. "L20", "Line_15", "Sch M-1") --
+    those are calculation/support schedules for a specific filing line,
+    not raw data sources, even when they're self-contained with nothing
+    formula-feeding them.
+    """
+    fed_by_traced = {}   # dst -> set of src, from formula/named-range evidence only
+    best_parent_traced = {}  # sheet -> (parent, tier, confidence), highest confidence wins
+
+    for (src, dst), info in traced_edges.items():
+        fed_by_traced.setdefault(dst, set()).add(src)
+        if src not in best_parent_traced or info["confidence"] > best_parent_traced[src][2]:
+            best_parent_traced[src] = (dst, info["tier"], info["confidence"])
+
+    traced_sheets = {root_sheet} | {s for pair in traced_edges for s in pair}
+
+    nodes = []
+    for sheet in sorted(traced_sheets):
+        if sheet == root_sheet:
+            nodes.append({
+                "sheet_name": sheet, "classification": "Output node",
+                "parent_sheet": None, "filing_reference": root_sheet,
+                "confidence_score": 100, "match_method": None,
+            })
+            continue
+        is_line_schedule = matches_line_schedule_pattern(sheet, line_schedule_pattern)
+        classification = "Process node" if (sheet in fed_by_traced or is_line_schedule) else "Input source"
+        parent_sheet, tier, confidence = best_parent_traced.get(sheet, (None, None, 0))
+        nodes.append({
+            "sheet_name": sheet, "classification": classification,
+            "parent_sheet": parent_sheet, "filing_reference": root_sheet,
+            "confidence_score": confidence, "match_method": tier,
+        })
+
+    for sheet, info in fallback_edges.items():
+        is_line_schedule = matches_line_schedule_pattern(sheet, line_schedule_pattern)
+        nodes.append({
+            "sheet_name": sheet, "classification": "Process node" if is_line_schedule else "Input source",
+            "parent_sheet": info["parent"], "filing_reference": root_sheet,
+            "confidence_score": info["confidence"], "match_method": info["tier"],
+        })
+
+    relationships = [
+        {"source": src, "target": dst, "relationship": "feeds"}
+        for (src, dst) in traced_edges
+    ] + [
+        {"source": sheet, "target": info["parent"], "relationship": "feeds"}
+        for sheet, info in fallback_edges.items()
+    ]
+
+    return {
+        "filing_reference": root_sheet,
+        "final_output": final_output_desc,
+        "nodes": nodes,
+        "relationships": relationships,
+    }
+
+
+# ---------------------------------------------------------------------------
+# EXPORT HELPERS
+# ---------------------------------------------------------------------------
+
+def lineage_to_excel_bytes(lineage: dict) -> bytes:
+    nodes_df = pd.DataFrame(lineage["nodes"])
+    rel_df = pd.DataFrame(lineage["relationships"])
+    summary_df = pd.DataFrame([{
+        "Filing Reference": lineage["filing_reference"],
+        "Final Output": lineage["final_output"],
+        "Node Count": len(lineage["nodes"]),
+        "Relationship Count": len(lineage["relationships"]),
+    }])
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, index=False, sheet_name="Summary")
+        nodes_df.to_excel(writer, index=False, sheet_name="Nodes")
+        rel_df.to_excel(writer, index=False, sheet_name="Relationships")
+    return buf.getvalue()
+
+
+NODE_COLOR = {"Input source": "#2ecc71", "Process node": "#2a9d8f", "Output node": "#f1c40f"}
+
+
+def compute_lineage_depths(lineage: dict) -> dict:
+    """
+    BFS distance from the root over the relationship edges, root = depth 0.
+    A direct feeder of the root is depth 1, a feeder of that is depth 2,
+    etc. This gives a real, meaningful level for each node (based on
+    actual traced/fallback lineage position) instead of relying on
+    vis-network's automatic leveling, which doesn't know which node is
+    the conceptually "final" one.
+    """
+    root = lineage["filing_reference"]
+    feeds_into = {}  # src -> dst  (each node has exactly one primary parent in this schema)
+    for n in lineage["nodes"]:
+        if n["parent_sheet"]:
+            feeds_into[n["sheet_name"]] = n["parent_sheet"]
+
+    depths = {root: 0}
+    for n in lineage["nodes"]:
+        sheet = n["sheet_name"]
+        if sheet in depths:
+            continue
+        # walk up the parent chain until we hit something with a known depth
+        chain = []
+        cursor = sheet
+        seen = set()
+        while cursor not in depths and cursor in feeds_into and cursor not in seen:
+            seen.add(cursor)
+            chain.append(cursor)
+            cursor = feeds_into[cursor]
+        base_depth = depths.get(cursor, 0)
+        # chain[0] is the farthest sheet (original), chain[-1] is nearest
+        # the already-known cursor -- so chain[0] gets the largest depth
+        for j, s in enumerate(chain):
+            depths[s] = base_depth + (len(chain) - j)
+    return depths
+
+
+def build_lineage_visual_html(lineage: dict) -> str:
+    depths = compute_lineage_depths(lineage)
+    max_depth = max(depths.values()) if depths else 0
+
+    nodes_json = json.dumps([
+        {
+            "id": n["sheet_name"], "label": n["sheet_name"],
+            "color": NODE_COLOR.get(n["classification"], "#888888"),
+            "shape": "box", "size": 30 if n["classification"] == "Output node" else 24,
+            "level": depths.get(n["sheet_name"], max_depth),
+            "title": (
+                f"{n['sheet_name']}\\nClassification: {n['classification']}"
+                f"\\nConfidence: {n['confidence_score']}%"
+                f"\\nMethod: {n['match_method'] or '(root)'}"
+            ),
+            "font": {"color": "#ffffff", "size": 16},
+        }
+        for n in lineage["nodes"]
+    ])
+    edges_json = json.dumps([
+        {"from": r["source"], "to": r["target"], "label": r["relationship"], "arrows": "to"}
+        for r in lineage["relationships"]
+    ])
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8">
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  html, body {{ margin:0; padding:0; background:#111111; }}
+  #tree {{ width:100vw; height:100vh; }}
+  #hint {{
+    position:fixed; top:10px; left:10px; color:white; font-family:sans-serif;
+    font-size:14px; background:rgba(0,0,0,0.6); padding:10px 16px; border-radius:6px; max-width:460px;
+  }}
+</style></head>
+<body>
+<div id="hint">
+  <b>Filing reference:</b> {lineage['filing_reference']}<br>
+  <b>Final output:</b> {lineage['final_output']}<br>
+  Green = Input source, teal = Process node, gold = Output node (root).<br>
+  Top = furthest upstream, bottom = filing output. Drag to nudge within a level if boxes overlap.
+</div>
+<div id="tree"></div>
+<script>
+  var nodes = new vis.DataSet({nodes_json});
+  var edges = new vis.DataSet({edges_json});
+  var network = new vis.Network(document.getElementById('tree'), {{nodes: nodes, edges: edges}}, {{
+    layout: {{
+      hierarchical: {{
+        enabled: true, direction: "DU", sortMethod: "directed",
+        levelSeparation: 220, nodeSpacing: 260, treeSpacing: 280
+      }}
+    }},
+    physics: {{
+      hierarchicalRepulsion: {{ nodeDistance: 260 }},
+      solver: "hierarchicalRepulsion"
+    }},
+    interaction: {{ dragNodes: true, dragView: true, zoomView: true }},
+    edges: {{
+      smooth: {{ type: "cubicBezier", forceDirection: "vertical" }},
+      arrows: {{ to: {{ enabled: true }} }}, color: "#888888",
+      font: {{ color: "#ffffff", strokeWidth: 3, strokeColor: "#111111" }}
+    }},
+    nodes: {{ font: {{ color: "#ffffff", size: 16 }} }}
+  }});
+  network.once("stabilizationIterationsDone", function () {{ network.setOptions({{physics: false}}); }});
+</script>
+</body></html>"""
+
+
+# ---------------------------------------------------------------------------
+# STREAMLIT UI
+# ---------------------------------------------------------------------------
+
+def run_app():
+    st.set_page_config(page_title="Filing Lineage", layout="wide")
+    st.title("Filing-Centric Lineage")
+    st.caption("Pick your filing reference sheet -> trace every real formula link feeding it -> fuzzy-fallback for anything formulas don't reach.")
+
+    uploaded = st.file_uploader("Upload workbook", type=["xlsx", "xls"])
+    if uploaded is None:
+        st.info("Upload your workbook to get started.")
+        return
+
+    file_bytes = uploaded.getvalue()
+
+    if "fld_formulas" not in st.session_state or st.session_state.get("_fld_name") != uploaded.name:
+        with st.spinner("Reading formulas and defined names..."):
+            formulas, sheetnames, defined_name_map = load_workbook_formulas(file_bytes)
+            raw_sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None)
+            st.session_state["fld_formulas"] = formulas
+            st.session_state["fld_sheetnames"] = sheetnames
+            st.session_state["fld_defined_names"] = defined_name_map
+            st.session_state["fld_raw_sheets"] = raw_sheets
+            st.session_state["_fld_name"] = uploaded.name
+            st.session_state.pop("fld_lineage", None)
+
+    sheetnames = st.session_state["fld_sheetnames"]
+    formulas = st.session_state["fld_formulas"]
+    defined_name_map = st.session_state["fld_defined_names"]
+    raw_sheets = st.session_state["fld_raw_sheets"]
+
+    st.success(f"Loaded {len(sheetnames)} sheets, {len(formulas)} formulas, {len(defined_name_map)} defined name(s).")
+
+    st.subheader("1. Filing reference sheet")
+    default_idx = next((i for i, s in enumerate(sheetnames) if "taxable income" in s.lower()), 0)
+    root_sheet = st.selectbox("This sheet is the root/output node -- the final aggregation sheet.", sheetnames, index=default_idx)
+
+    st.subheader("2. Final output cell (Taxable Income / Line 30)")
+    input_mode = st.radio(
+        "How do you want to specify it?",
+        ["Enter cell reference directly", "Pick from auto-detected candidates"],
+        horizontal=True,
+    )
+
+    if input_mode == "Enter cell reference directly":
+        cell_ref = st.text_input("Cell reference on the filing reference sheet (e.g. B30)", value="")
+        if cell_ref.strip():
+            info = lookup_cell_direct(file_bytes, root_sheet, cell_ref)
+            if info is None:
+                st.error(f"Couldn't parse or find '{cell_ref}' on {root_sheet} -- check the reference (e.g. B30).")
+                final_output_desc = None
+            else:
+                label_text = f'"{info["label"]}"' if info["label"] else "(no label found in column A)"
+                if info["value"] is None and info["formula"]:
+                    st.warning(
+                        f"Row {info['row']}, col {info['col']}: {label_text}, formula {info['formula']} -- "
+                        f"no cached value (this workbook wasn't last saved by Excel itself, so openpyxl can't "
+                        f"read a computed result). The formula and label look fine to use regardless."
+                    )
+                else:
+                    st.success(f"Row {info['row']}, col {info['col']}: {label_text} = {info['value']}")
+                final_output_desc = f'{label_text} (cell {info["col"]}{info["row"]}) on {root_sheet}, value {info["value"]}'
+        else:
+            st.info("Enter a cell reference to confirm it before building the lineage.")
+            final_output_desc = None
+    else:
+        candidates = detect_final_output_cell(raw_sheets[root_sheet])
+        if candidates:
+            options = [f"Row {r}, col {c}: \"{text}\" (match {score}%)" for r, c, text, score in candidates]
+            choice_idx = st.selectbox("Best guesses, ranked -- confirm or pick a different one:", range(len(options)), format_func=lambda i: options[i])
+            chosen = candidates[choice_idx]
+            final_output_desc = f'"{chosen[2]}" (row {chosen[0]}, col {chosen[1]}) on {root_sheet}'
+        else:
+            st.warning("No row matched 'Taxable Income' / 'Line 30' well -- switch to direct entry instead.")
+            final_output_desc = None
+
+    st.subheader("3. Build the lineage")
+    with st.expander("Line-schedule naming pattern (advanced)"):
+        st.write(
+            "Sheets matching this pattern are treated as calculation/support schedules "
+            "(Process node) even if nothing formula-feeds them -- e.g. \"L20\", \"Line_15\", "
+            "\"Sch M-1\" are line-item schedules for the return, not raw data sources, even "
+            "when they're self-contained. Adjust if your tabs follow a different convention."
+        )
+        line_schedule_pattern = st.text_input(
+            "Regex (case-insensitive, matched from the start of the sheet name)",
+            value=LINE_SCHEDULE_PATTERN_DEFAULT,
+        )
+        test_name = st.text_input("Test a sheet name against this pattern", value="L20 Depreciation")
+        if test_name:
+            matched = matches_line_schedule_pattern(test_name, line_schedule_pattern)
+            st.caption(("Matches" if matched else "Does not match") + f" -- \"{test_name}\"")
+
+    if st.button("Trace lineage from this root", type="primary", disabled=final_output_desc is None):
+        with st.spinner("Tracing formulas backward from root..."):
+            traced_edges, visited = trace_lineage_from_root(root_sheet, formulas, defined_name_map)
+        unmapped = [s for s in sheetnames if s not in visited]
+        with st.spinner(f"Running fallback matching on {len(unmapped)} unreached sheet(s)..."):
+            fallback_edges = fallback_match_unreached_sheets(unmapped, list(visited), raw_sheets)
+        lineage = classify_and_assemble(root_sheet, traced_edges, fallback_edges, final_output_desc, line_schedule_pattern)
+        st.session_state["fld_lineage"] = lineage
+
+        excluded = [s for s in unmapped if s not in fallback_edges]
+        if excluded:
+            st.warning(f"{len(excluded)} sheet(s) had no formula path AND no match clearing {CONFIDENCE_THRESHOLD}% -- excluded: {', '.join(excluded)}")
+
+    if "fld_lineage" in st.session_state:
+        lineage = st.session_state["fld_lineage"]
+
+        st.divider()
+        st.subheader("4. Result")
+        nodes_df = pd.DataFrame(lineage["nodes"])
+        rel_df = pd.DataFrame(lineage["relationships"])
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("**Nodes**")
+            st.dataframe(nodes_df, use_container_width=True, hide_index=True)
+        with col2:
+            st.write("**Relationships**")
+            st.dataframe(rel_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("5. Outputs")
+
+        dl_col, vis_col, json_col = st.columns(3)
+
+        with dl_col:
+            st.download_button(
+                "Download Excel", data=lineage_to_excel_bytes(lineage),
+                file_name="filing_lineage.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        with vis_col:
+            if st.button("Open Visual in New Tab"):
+                html = build_lineage_visual_html(lineage)
+                tmpdir = tempfile.mkdtemp(prefix="filing_lineage_")
+                html_path = os.path.join(tmpdir, "lineage_visual.html")
+                with open(html_path, "w", encoding="utf-8") as f:
+                    f.write(html)
+                webbrowser.open(f"file://{html_path}")
+                st.success("Opened in a new browser tab (same machine this app is running on).")
+
+        with json_col:
+            st.download_button(
+                "Download JSON", data=json.dumps(lineage, indent=2),
+                file_name="filing_lineage.json", mime="application/json",
+            )
+
+
+if __name__ == "__main__":
+    if st is None:
+        raise SystemExit("Streamlit is required to run this app: pip install streamlit")
+    run_app()
