@@ -571,18 +571,18 @@ __NAV__
     layout: {
       hierarchical: {
         enabled: true, direction: "UD", sortMethod: "directed",
-        levelSeparation: 160, nodeSpacing: 180, treeSpacing: 220
+        levelSeparation: __LEVEL_SEP__, nodeSpacing: __NODE_SPACING__, treeSpacing: __TREE_SPACING__
       }
     },
     physics: {
-      hierarchicalRepulsion: { nodeDistance: 180 },
+      hierarchicalRepulsion: { nodeDistance: __NODE_SPACING__ },
       solver: "hierarchicalRepulsion"
     },
     edges: {
       smooth: { type: "cubicBezier", forceDirection: "vertical" },
       arrows: { to: { enabled: true } },
       color: "#888888",
-      font: { color: "#ffffff" }
+      font: { color: "#ffffff", strokeWidth: 3, strokeColor: "#111111" }
     },
     nodes: { font: { color: "#ffffff", size: 16 } }
   };
@@ -777,6 +777,44 @@ def nav_html(view_keys, active_key):
     return '<div id="navBar">' + "".join(links) + "</div>"
 
 
+def add_edge_curvature(edges_list):
+    """
+    Gives each edge a slight, alternating curve instead of a straight
+    line. When several edges run nearly parallel -- which is exactly
+    what happens when a hierarchical layout puts many nodes on one row,
+    or when several sources converge on one target -- straight edges
+    sit on top of each other and their labels become unreadable. Curving
+    them in alternating directions with varying strength physically
+    separates the paths (and their labels) even when the underlying
+    nodes are packed close together.
+    """
+    for i, edge in enumerate(edges_list):
+        direction = "curvedCW" if i % 2 == 0 else "curvedCCW"
+        roundness = 0.15 + 0.12 * (i % 4)
+        edge["smooth"] = {"type": direction, "roundness": roundness}
+    return edges_list
+
+
+def render_view(nodes, edges, nav, hint_replacement, level_sep, node_spacing, tree_spacing):
+    """
+    Shared template assembly for every view (build_html, system overview,
+    per-system) -- applies edge curvature, injects nodes/edges/nav, and
+    sets layout spacing sized for that view's node count/size so labels
+    have room instead of overlapping.
+    """
+    add_edge_curvature(edges)
+    html = HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)).replace("__EDGES__", json.dumps(edges))
+    html = html.replace("__NAV__", nav)
+    html = html.replace("__LEVEL_SEP__", str(level_sep))
+    html = html.replace("__NODE_SPACING__", str(node_spacing))
+    html = html.replace("__TREE_SPACING__", str(tree_spacing))
+    html = html.replace(
+        "Green = input sheet, orange = output sheet, teal = in-between.<br>",
+        hint_replacement,
+    )
+    return html
+
+
 def build_html(flow, min_cells, classification=None, nav=""):
     """
     classification, if given ({sheet: system}), colors nodes by system
@@ -837,13 +875,10 @@ def build_html(flow, min_cells, classification=None, nav=""):
         if classification else
         "Green = input sheet, orange = output sheet, teal = in-between.<br>"
     )
-    html = HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)).replace("__EDGES__", json.dumps(edges))
-    html = html.replace("__NAV__", nav)
-    html = html.replace(
-        "Green = input sheet, orange = output sheet, teal = in-between.<br>",
-        hint_extra,
+    return render_view(
+        nodes, edges, nav, hint_extra,
+        level_sep=180, node_spacing=220, tree_spacing=240,
     )
-    return html
 
 
 def build_system_overview_flow(flow, classification):
@@ -898,12 +933,11 @@ def build_system_overview_html(flow, classification, nav=""):
             "label": str(count), "title": f"{count} cross-sheet formula cells feed {dst} from {src}",
         })
 
-    html = HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)).replace("__EDGES__", json.dumps(edges))
-    html = html.replace("__NAV__", nav)
-    html = html.replace(
-        "Green = input sheet, orange = output sheet, teal = in-between.<br>",
+    html = render_view(
+        nodes, edges, nav,
         "System-level view: each box is a whole system, arrows show how they feed each other. "
         "Not clickable -- switch to a sheet-level view to open specific tabs.<br>",
+        level_sep=280, node_spacing=340, tree_spacing=360,
     )
     return html
 
@@ -978,12 +1012,11 @@ def build_per_system_html(flow, classification, target_system, nav=""):
             "label": str(count), "title": f"{count} formula cells",
         })
 
-    html = HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)).replace("__EDGES__", json.dumps(edge_list))
-    html = html.replace("__NAV__", nav)
-    html = html.replace(
-        "Green = input sheet, orange = output sheet, teal = in-between.<br>",
+    html = render_view(
+        nodes, edge_list, nav,
         f"{target_system} internal flow. Diamonds = other systems this connects to "
         f"(not individually clickable) -- boxes are real sheets in {target_system}.<br>",
+        level_sep=200, node_spacing=250, tree_spacing=270,
     )
     return html
 
