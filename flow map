@@ -1,0 +1,1156 @@
+"""
+sheet_tree_server.py
+----------------------
+Interactive tree of sheet-to-sheet data flow. Clicking a sheet box
+ACTUALLY switches to that sheet in Excel - a plain browser link can't
+do this reliably (browsers strip the sheet info when handing a file
+off to Excel), so this runs a small local server that uses pywin32
+(COM automation - the same mechanism VBA macros use) to control Excel
+directly. No Excel add-in required.
+
+Requires:
+    pip install openpyxl pywin32
+    Excel must be installed (this drives the real Excel application).
+
+Usage:
+    python sheet_tree_server.py workbook.xlsx
+    python sheet_tree_server.py workbook.xlsx 5      (only show links with 5+ cells)
+
+This opens the tree in your browser automatically and starts a local
+server. Leave the terminal window open while you use it - closing it
+(Ctrl+C) stops the server. Clicking a sheet box brings Excel to the
+front and switches to that sheet.
+
+In the browser: type a sheet name into the search box (top-left) and
+press Enter to zoom to it and highlight it in the tree.
+
+On startup this also writes a companion "<workbook>_trace_data.xlsx"
+next to the workbook, with one row per sheet: what feeds it, what it
+feeds, reference counts in each direction, and the cross-sheet
+formulas located on that sheet.
+"""
+
+import json
+import os
+import re
+import sys
+import threading
+import time
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter, column_index_from_string
+
+DEFAULT_MIN_CELLS = 3
+PORT = 0  # 0 = let the OS pick a free port - avoids collisions with a still-running
+          # earlier session, which was silently serving stale data on a fixed port
+
+# Palette for system-level coloring, used once a classification file is
+# supplied. Falls back to a hashed color for any label not in this list,
+# so an unexpected "Final System" value from the classification file still
+# renders instead of erroring.
+SYSTEM_COLORS = {
+    "SAP_TB":   "#4285F4",
+    "ERS":      "#34A853",
+    "DTTU":     "#FBBC05",
+    "Longview": "#9C27B0",
+    "Corptax":  "#EA4335",
+    "Filing":   "#00ACC1",
+    "Unclassified": "#888888",
+}
+
+
+def system_color(system_name):
+    if system_name in SYSTEM_COLORS:
+        return SYSTEM_COLORS[system_name]
+    # deterministic fallback color for any label outside the known set
+    h = abs(hash(system_name)) % 0xFFFFFF
+    return f"#{h:06x}"
+
+
+def load_classification(path):
+    """
+    Reads a classification workbook (the 'tab_classification.xlsx' export
+    from the lineage dashboard) and returns {sheet_name: system_label},
+    skipping rows marked Skip/blank. Matches the "Sheet Name" / "Final
+    System" columns by header text, case-insensitively, so it still works
+    if column order changes.
+    """
+    wb = load_workbook(path, data_only=True, read_only=True)
+    ws = wb.worksheets[0]
+    rows = ws.iter_rows(values_only=True)
+    header = next(rows)
+    header_lower = [str(h).strip().lower() if h else "" for h in header]
+    try:
+        sheet_col = header_lower.index("sheet name")
+        system_col = header_lower.index("final system")
+    except ValueError:
+        wb.close()
+        raise ValueError(
+            "Classification file must have 'Sheet Name' and 'Final System' columns "
+            "(the export from the lineage dashboard's tab-classification step)."
+        )
+
+    classification = {}
+    for row in rows:
+        if row is None or len(row) <= max(sheet_col, system_col):
+            continue
+        sheet_name = row[sheet_col]
+        system = row[system_col]
+        if not sheet_name or not system:
+            continue
+        system = str(system).strip()
+        if system.lower() in ("skip", ""):
+            continue
+        classification[str(sheet_name)] = system
+    wb.close()
+    return classification
+
+CELL_REF_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3}\$?\d{1,7})(?::(\$?[A-Z]{1,3}\$?\d{1,7}))?(?!\()"
+)
+COLUMN_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?([A-Z]{1,3})\$?:\$?([A-Z]{1,3})\$?(?![A-Za-z0-9_])"
+)
+ROW_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?(\d{1,7})\$?:\$?(\d{1,7})\$?(?![A-Za-z0-9_])"
+)
+
+FULL_RANGE_ROW_CAP = 5000
+FULL_RANGE_COL_CAP = 200
+
+# Cap on how many individual cross-sheet formulas get listed in the
+# Excel export's "Cross-Sheet Formulas" column per sheet - a sheet with
+# thousands of cross-sheet formulas would otherwise produce a single
+# cell too large to be useful (or to open comfortably).
+MAX_FORMULAS_LISTED = 50
+
+
+def _spans_overlap(span, other_spans):
+    s0, s1 = span
+    for a0, a1 in other_spans:
+        if s0 < a1 and a0 < s1:
+            return True
+    return False
+
+
+def extract_refs(formula, current_sheet, sheet_bounds):
+    """Returns list of (sheet, cell, is_range). For a range reference
+    (A2:A500, a full column, or a full row), only the FIRST and LAST
+    cell of that range are returned - not every cell in between. This
+    keeps things fast and lets ranges still get dependent arrows drawn
+    (just on their two boundary cells) instead of being skipped
+    entirely or expanding to thousands of individual cells."""
+    refs = []
+    matched_spans = []
+
+    for m in CELL_REF_RE.finditer(formula):
+        matched_spans.append(m.span())
+        sheet = m.group(1) or m.group(2) or current_sheet
+        cell1 = m.group(3).replace('$', '')
+        cell2 = m.group(4)
+        if cell2:
+            cell2 = cell2.replace('$', '')
+            refs.append((sheet, cell1, True))
+            refs.append((sheet, cell2, True))
+        else:
+            refs.append((sheet, cell1, False))
+
+    for m in COLUMN_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), matched_spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        col1, col2 = m.group(3), m.group(4)
+        c1, c2 = column_index_from_string(col1), column_index_from_string(col2)
+        if c1 > c2:
+            c1, c2 = c2, c1
+        max_row = min(sheet_bounds.get(sheet, (FULL_RANGE_ROW_CAP, 1))[0], FULL_RANGE_ROW_CAP) or 1
+        refs.append((sheet, f"{get_column_letter(c1)}1", True))
+        refs.append((sheet, f"{get_column_letter(c2)}{max_row}", True))
+
+    for m in ROW_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), matched_spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        row1, row2 = int(m.group(3)), int(m.group(4))
+        if row1 > row2:
+            row1, row2 = row2, row1
+        max_col = min(sheet_bounds.get(sheet, (1, FULL_RANGE_COL_CAP))[1], FULL_RANGE_COL_CAP) or 1
+        refs.append((sheet, f"A{row1}", True))
+        refs.append((sheet, f"{get_column_letter(max_col)}{row2}", True))
+
+    return refs
+
+
+def load_formulas(path):
+    """Uses read_only=True for much faster loading on large workbooks -
+    streams rows instead of building the full in-memory object model.
+    Note: in read_only mode, blank cells come back as a bare EmptyCell
+    with no .coordinate attribute at all, so position is tracked by
+    enumerating rows/columns ourselves instead of reading it off the cell."""
+    wb = load_workbook(path, data_only=False, read_only=True)
+    formulas = {}
+    sheet_bounds = {}
+    for ws in wb.worksheets:
+        max_row = ws.max_row or 1
+        max_col = ws.max_column or 1
+        sheet_bounds[ws.title] = (max_row, max_col)
+        rows = ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col)
+        for r_idx, row in enumerate(rows, start=1):
+            for c_idx, cell in enumerate(row, start=1):
+                if isinstance(cell.value, str) and cell.value.startswith('='):
+                    coord = f"{get_column_letter(c_idx)}{r_idx}"
+                    formulas[(ws.title, coord)] = cell.value
+    sheetnames = wb.sheetnames
+    wb.close()
+    return formulas, sheetnames, sheet_bounds
+
+
+def build_sheet_flow(formulas, sheet_bounds, min_cells=1):
+    """Returns (flow, precedent_cells, dependent_cells):
+    - flow: (src_sheet, dst_sheet) -> cell count, for the tree/edges
+    - precedent_cells: sheet -> cells on that sheet whose formulas pull
+      from another sheet (used to draw Trace Precedents arrows)
+    - dependent_cells: sheet -> cells on that sheet that get pulled INTO
+      formulas on other sheets (used to draw Trace Dependents arrows).
+      For a range reference, only its first and last cell are included.
+
+    Only sheet-pairs with min_cells+ total links are included in
+    precedent_cells/dependent_cells - matching the same threshold used
+    to decide which links show up in the tree diagram, so arrow-drawing
+    doesn't include weak 1-2 cell links that aren't even visible in the
+    graph."""
+    flow = {}
+    raw_refs = []  # (dst_sheet, dst_cell, src_sheet, src_cell)
+    for (sheet, cell), f in formulas.items():
+        refs = extract_refs(f, sheet, sheet_bounds)
+        cross_sheet_refs = [(s, c, is_range) for s, c, is_range in refs if s != sheet]
+        source_sheets = set(s for s, c, is_range in cross_sheet_refs)
+        for src in source_sheets:
+            key = (src, sheet)
+            flow[key] = flow.get(key, 0) + 1
+        for src_sheet, src_cell, is_range in cross_sheet_refs:
+            raw_refs.append((sheet, cell, src_sheet, src_cell))
+
+    precedent_cells = {}
+    dependent_cells = {}
+    for dst_sheet, dst_cell, src_sheet, src_cell in raw_refs:
+        if flow.get((src_sheet, dst_sheet), 0) < min_cells:
+            continue
+        precedent_cells.setdefault(dst_sheet, set()).add(dst_cell)
+        dependent_cells.setdefault(src_sheet, set()).add(src_cell)
+
+    return flow, precedent_cells, dependent_cells
+
+
+def export_trace_to_excel(formulas, sheet_bounds, flow, sheetnames, output_path):
+    """Writes one row per sheet to a new .xlsx summarizing its place in
+    the cross-sheet formula flow:
+        Sheet Name | Fed By (upstream sheets) | Fed Into (downstream
+        sheets) | Input Reference Count | Output Reference Count |
+        Cross-Sheet Formulas On This Sheet
+
+    "Fed By" / "Fed Into" and the reference counts are read straight off
+    `flow` (all links, same source of truth as the tree diagram, not
+    filtered by min_cells - so this export is a complete record even if
+    the diagram itself is showing a filtered view).
+
+    The formulas column is populated by re-checking each formula on a
+    sheet for any cross-sheet reference via extract_refs - same logic
+    build_sheet_flow uses, just organized per-sheet instead of
+    aggregated into counts. Long lists are capped (MAX_FORMULAS_LISTED)
+    so a sheet with thousands of cross-sheet formulas doesn't produce
+    one unreadably huge cell.
+    """
+    formulas_by_sheet = {}
+    for (sheet, cell), f in formulas.items():
+        refs = extract_refs(f, sheet, sheet_bounds)
+        if any(s != sheet for s, c, is_range in refs):
+            formulas_by_sheet.setdefault(sheet, []).append(f"{cell}: {f}")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet Trace"
+
+    headers = [
+        "Sheet Name",
+        "Fed By (Upstream Sheets)",
+        "Fed Into (Downstream Sheets)",
+        "Input Reference Count",
+        "Output Reference Count",
+        "Cross-Sheet Formulas On This Sheet",
+    ]
+    ws.append(headers)
+    for col_idx in range(1, len(headers) + 1):
+        ws.cell(row=1, column=col_idx).font = Font(bold=True)
+
+    for sheet in sorted(sheetnames):
+        fed_by = sorted({src for (src, dst) in flow if dst == sheet})
+        fed_into = sorted({dst for (src, dst) in flow if src == sheet})
+        input_count = sum(v for (src, dst), v in flow.items() if dst == sheet)
+        output_count = sum(v for (src, dst), v in flow.items() if src == sheet)
+
+        f_list = formulas_by_sheet.get(sheet, [])
+        formulas_text = "; ".join(f_list[:MAX_FORMULAS_LISTED])
+        if len(f_list) > MAX_FORMULAS_LISTED:
+            formulas_text += f" ... ({len(f_list) - MAX_FORMULAS_LISTED} more not shown)"
+
+        ws.append([
+            sheet,
+            ", ".join(fed_by) if fed_by else "(none)",
+            ", ".join(fed_into) if fed_into else "(none)",
+            input_count,
+            output_count,
+            formulas_text if formulas_text else "(none)",
+        ])
+
+    widths = [22, 30, 30, 14, 14, 100]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    ws.freeze_panes = "A2"
+    wb.save(output_path)
+    return output_path
+
+
+_last_auto_unhidden = {"path": None, "sheet": None}
+
+
+def open_sheet_in_excel(workbook_path, sheet_name, precedent_cells=None, dependent_cells=None):
+    """Uses pywin32 COM automation to actually drive Excel - no add-in
+    required, this is the same mechanism VBA macros use. Grabs an
+    already-running Excel instance if one has this workbook open;
+    otherwise starts Excel and opens it fresh. Draws Trace Precedents
+    arrows on precedent_cells (this sheet's formulas pulling from
+    elsewhere) and Trace Dependents arrows on dependent_cells (this
+    sheet's cells being pulled into formulas elsewhere) - covers both
+    directions so source/input sheets, which have no precedents of
+    their own, still show something meaningful."""
+    import win32com.client as win32
+    import pywintypes
+    import win32gui
+    import win32process
+    import win32api
+    import win32con
+
+    def com_retry(func, attempts=6, delay=0.4, required=True):
+        """Retries a COM call a few times before giving up - Excel's COM
+        interface can be transiently 'not ready' right after launching,
+        opening a workbook, or switching sheets, which raises errors on
+        whatever call happens to run next (not always the same one).
+        required=False swallows the final failure instead of raising."""
+        last_exc = None
+        for _ in range(attempts):
+            try:
+                return func()
+            except Exception as e:
+                last_exc = e
+                time.sleep(delay)
+        if required:
+            raise last_exc
+        return None
+
+    def norm(p):
+        return os.path.normcase(os.path.normpath(p))
+
+    abs_path = os.path.abspath(workbook_path)
+    target_norm = norm(abs_path)
+    target_base = os.path.basename(abs_path).lower()
+
+    excel = None
+    wb = None
+
+    try:
+        excel = win32.GetActiveObject("Excel.Application")
+    except pywintypes.com_error:
+        excel = None
+
+    if excel is not None:
+        for book in excel.Workbooks:
+            try:
+                if norm(book.FullName) == target_norm:
+                    wb = book
+                    break
+            except Exception:
+                continue
+        if wb is None:
+            for book in excel.Workbooks:
+                try:
+                    if book.Name.lower() == target_base:
+                        wb = book
+                        break
+                except Exception:
+                    continue
+
+    if excel is None:
+        excel = win32.Dispatch("Excel.Application")
+
+    com_retry(lambda: setattr(excel, "Visible", True))
+    com_retry(lambda: setattr(excel, "DisplayAlerts", False), required=False)
+    com_retry(lambda: setattr(excel, "AskToUpdateLinks", False), required=False)
+
+    if wb is None:
+        wb = com_retry(lambda: excel.Workbooks.Open(abs_path, 0))
+
+    # Files in Downloads are usually tagged "from the internet" by Windows,
+    # so Excel opens them in Protected View - which blocks most automation
+    # until the user manually clicks "Enable Editing". Detect and exit
+    # Protected View automatically instead.
+    def exit_protected_view():
+        if wb.ProtectedViewWindow is not None:
+            return wb.ProtectedViewWindow.Edit()
+        return wb
+    new_wb = com_retry(exit_protected_view, required=False)
+    if new_wb is not None:
+        wb = new_wb
+
+    com_retry(lambda: setattr(excel, "DisplayAlerts", False), required=False)
+    com_retry(lambda: wb.Activate())
+
+    # Re-hide whatever sheet we auto-unhid last time, if we're now
+    # switching to a different one.
+    global _last_auto_unhidden
+    if (_last_auto_unhidden["path"] == target_norm
+            and _last_auto_unhidden["sheet"] is not None
+            and _last_auto_unhidden["sheet"] != sheet_name):
+        com_retry(lambda: setattr(wb.Sheets(_last_auto_unhidden["sheet"]), "Visible", 0), required=False)
+        _last_auto_unhidden["sheet"] = None
+
+    sht = com_retry(lambda: wb.Sheets(sheet_name))
+
+    was_hidden = com_retry(lambda: sht.Visible != -1, required=False)  # -1 = xlSheetVisible
+    if was_hidden:
+        com_retry(lambda: setattr(sht, "Visible", -1), required=False)
+    com_retry(lambda: sht.Activate())
+
+    if was_hidden:
+        _last_auto_unhidden["path"] = target_norm
+        _last_auto_unhidden["sheet"] = sheet_name
+
+    # Clear any previously-drawn tracer arrows on this sheet, then draw
+    # fresh Trace Precedents arrows on every cell here that pulls from
+    # another sheet - same visual Excel draws when you click the
+    # Formulas > Trace Precedents button yourself.
+    #
+    # NOTE: an earlier version tried batching cells into combined
+    # multi-area Ranges to cut down COM calls. That silently broke
+    # arrow-drawing entirely - ShowPrecedents/ShowDependents apparently
+    # don't support multi-area Ranges the way most Range methods do, so
+    # every batched call failed (silently swallowed by the retry logic)
+    # and the repeated retries-with-delays across many batches is what
+    # caused the long hang. Back to one call per cell, which is what
+    # actually works - but with ScreenUpdating off during the loop
+    # (cuts real overhead, since Excel doesn't repaint after every
+    # single arrow) and a hard cap so a truly extreme sheet can't hang
+    # indefinitely or render an unreadably dense wall of arrows anyway.
+    MAX_ARROWS_PER_TYPE = 300
+
+    def draw_arrows(addresses, method_name):
+        addresses = list(addresses)
+        truncated = len(addresses) > MAX_ARROWS_PER_TYPE
+        if truncated:
+            addresses = addresses[:MAX_ARROWS_PER_TYPE]
+        for addr in addresses:
+            com_retry(lambda addr=addr: getattr(sht.Range(addr), method_name)(), required=False)
+        return truncated
+
+    com_retry(lambda: setattr(excel, "ScreenUpdating", False), required=False)
+    try:
+        com_retry(lambda: sht.ClearArrows(), required=False)
+        precedents_truncated = draw_arrows(precedent_cells, "ShowPrecedents") if precedent_cells else False
+        dependents_truncated = draw_arrows(dependent_cells, "ShowDependents") if dependent_cells else False
+    finally:
+        com_retry(lambda: setattr(excel, "ScreenUpdating", True), required=False)
+
+    # Force real foreground focus on THIS workbook's own window
+    # specifically. Windows blocks background processes from stealing
+    # focus by default; this combines two standard workarounds: a brief
+    # simulated Alt key-tap (satisfies one of Windows' focus-stealing
+    # conditions) plus attaching input threads together.
+    try:
+        hwnd = wb.Windows(1).Hwnd
+
+        win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+        win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+
+        fg_hwnd = win32gui.GetForegroundWindow()
+        fg_thread = win32process.GetWindowThreadProcessId(fg_hwnd)[0]
+        target_thread = win32process.GetWindowThreadProcessId(hwnd)[0]
+        current_thread = win32api.GetCurrentThreadId()
+
+        win32process.AttachThreadInput(fg_thread, current_thread, True)
+        win32process.AttachThreadInput(target_thread, current_thread, True)
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.BringWindowToTop(hwnd)
+            win32gui.SetForegroundWindow(hwnd)
+        finally:
+            win32process.AttachThreadInput(fg_thread, current_thread, False)
+            win32process.AttachThreadInput(target_thread, current_thread, False)
+    except Exception:
+        pass
+
+    return {"precedents_truncated": precedents_truncated, "dependents_truncated": dependents_truncated}
+
+
+HTML_TEMPLATE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  html, body { margin:0; padding:0; background:#111111; }
+  #tree { width:100vw; height:100vh; }
+  #hint {
+    position:fixed; top:10px; left:10px; color:white; font-family:sans-serif;
+    font-size:14px; background:rgba(0,0,0,0.55); padding:8px 14px; border-radius:6px;
+    max-width: 480px; z-index: 1000; pointer-events: auto;
+  }
+  #searchRow { margin-bottom:6px; }
+  #searchBox {
+    width: 220px; padding: 4px 8px; border-radius: 4px; border: 1px solid #555;
+    background: #222; color: #fff; font-size: 13px;
+  }
+  #searchGoBtn {
+    padding: 4px 10px; border-radius: 4px; border: 1px solid #555;
+    background: #333; color: #fff; font-size: 13px; cursor: pointer; margin-left: 4px;
+  }
+  #sheetPanel {
+    position:fixed; top:10px; right:10px; color:white; font-family:sans-serif;
+    font-size:13px; background:rgba(0,0,0,0.65); padding:8px 14px; border-radius:6px;
+    max-width: 260px; max-height: 85vh; z-index: 1000; overflow-y:auto;
+  }
+  #sheetPanelHeader { font-weight:bold; margin-bottom:6px; }
+  #sheetCheckboxes label { display:block; margin:2px 0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #navBar {
+    position:fixed; top:0; left:0; width:100%; background:#1a1a1a; padding:6px 10px;
+    font-family:sans-serif; font-size:13px; z-index:1001; border-bottom:1px solid #333;
+  }
+  #navBar a { color:#9ecbff; text-decoration:none; margin-right:14px; }
+  #navBar a.active { color:#ffffff; font-weight:bold; text-decoration:underline; }
+</style>
+</head>
+<body>
+__NAV__
+<div id="hint" style="margin-top:34px;">
+  <div id="searchRow">
+    <input type="text" id="searchBox" list="sheetList" placeholder="Search sheet name...">
+    <button id="searchGoBtn">Find</button>
+    <datalist id="sheetList"></datalist>
+  </div>
+  Click a sheet box to switch to that sheet in Excel. Right-click to hide/show it.<br>
+  Green = input sheet, orange = output sheet, teal = in-between.<br>
+  <label style="margin-right:12px;"><input type="checkbox" id="showPrecedents" checked> Precedent arrows</label>
+  <label><input type="checkbox" id="showDependents" checked> Dependent arrows</label>
+  <br>
+  <span id="status" style="opacity:0.8;"></span>
+</div>
+<div id="sheetPanel">
+  <div id="sheetPanelHeader">
+    Sheets <span id="togglePanelBtn" style="cursor:pointer; opacity:0.7;">[hide list]</span>
+    <br>
+    <span id="showAllBtn" style="cursor:pointer; text-decoration:underline; margin-right:10px;">Show all</span>
+    <span id="hideAllBtn" style="cursor:pointer; text-decoration:underline; margin-right:10px;">Hide all</span>
+    <span id="undoBtn" style="cursor:pointer; text-decoration:underline;">Undo</span>
+  </div>
+  <div id="sheetCheckboxes"></div>
+</div>
+<div id="tree"></div>
+<script type="text/javascript">
+  var nodes = new vis.DataSet(__NODES__);
+  var edges = new vis.DataSet(__EDGES__);
+  var container = document.getElementById('tree');
+  var data = { nodes: nodes, edges: edges };
+  var options = {
+    layout: {
+      hierarchical: {
+        enabled: true, direction: "UD", sortMethod: "directed",
+        levelSeparation: 160, nodeSpacing: 180, treeSpacing: 220
+      }
+    },
+    physics: {
+      hierarchicalRepulsion: { nodeDistance: 180 },
+      solver: "hierarchicalRepulsion"
+    },
+    edges: {
+      smooth: { type: "cubicBezier", forceDirection: "vertical" },
+      arrows: { to: { enabled: true } },
+      color: "#888888",
+      font: { color: "#ffffff" }
+    },
+    nodes: { font: { color: "#ffffff", size: 16 } }
+  };
+  var network = new vis.Network(container, data, options);
+
+  // Freeze layout once it settles, so hiding/showing nodes afterward
+  // is instant and doesn't re-trigger the physics engine (which was
+  // causing the whole graph to jiggle/shake on every toggle).
+  network.once("stabilizationIterationsDone", function () {
+    network.setOptions({ physics: false });
+  });
+
+  network.on("click", function (params) {
+    if (params.nodes.length > 0) {
+      var sheetName = params.nodes[0];
+      var nodeObj = nodes.get(sheetName);
+      if (nodeObj && nodeObj.clickable === false) {
+        return; // synthetic system/boundary node - nothing to open in Excel
+      }
+      var statusEl = document.getElementById('status');
+      var showPre = document.getElementById('showPrecedents').checked;
+      var showDep = document.getElementById('showDependents').checked;
+      statusEl.innerText = "Opening: " + sheetName + " ...";
+      fetch('/open?sheet=' + encodeURIComponent(sheetName)
+            + '&precedents=' + showPre + '&dependents=' + showDep)
+        .then(function(r) { return r.text(); })
+        .then(function(text) {
+          if (text.indexOf("ok") === 0) {
+            statusEl.innerText = "Opened: " + sheetName + (text.length > 2 ? " - " + text.slice(4, -1) : "");
+          } else {
+            statusEl.innerText = "Error opening " + sheetName + ": " + text;
+          }
+        })
+        .catch(function(err) {
+          statusEl.innerText = "Could not reach local server: " + err;
+        });
+    }
+  });
+
+  // Right-click a node to hide/show it directly, without hunting for it
+  // in the side panel. Keeps the checkbox list in sync either way.
+  network.on("oncontext", function (params) {
+    params.event.preventDefault();
+    var nodeId = network.getNodeAt(params.pointer.DOM);
+    if (nodeId) {
+      var node = nodes.get(nodeId);
+      applyChanges([{ id: nodeId, hidden: !node.hidden }]);
+    }
+  });
+
+  // --- Sheet show/hide panel, with undo history ---
+  var allSheetIds = nodes.getIds();
+  var checkboxContainer = document.getElementById('sheetCheckboxes');
+  var undoStack = [];
+
+  function setHidden(id, hidden) {
+    nodes.update({ id: id, hidden: hidden });
+    var cb = checkboxContainer.querySelector('input[data-sheet-id="' + id + '"]');
+    if (cb) cb.checked = !hidden;
+  }
+
+  // Applies a list of {id, hidden} changes as ONE undo step, so bulk
+  // actions (Show all / Hide all) undo in a single click too.
+  function applyChanges(changes) {
+    var undoEntry = [];
+    changes.forEach(function(change) {
+      var node = nodes.get(change.id);
+      undoEntry.push({ id: change.id, prevHidden: !!node.hidden });
+      setHidden(change.id, change.hidden);
+    });
+    undoStack.push(undoEntry);
+  }
+
+  allSheetIds.sort().forEach(function(id) {
+    var label = document.createElement('label');
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = true;
+    cb.dataset.sheetId = id;
+    cb.addEventListener('change', function() {
+      applyChanges([{ id: id, hidden: !cb.checked }]);
+    });
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(' ' + id));
+    checkboxContainer.appendChild(label);
+  });
+
+  document.getElementById('showAllBtn').addEventListener('click', function() {
+    applyChanges(allSheetIds.map(function(id) { return { id: id, hidden: false }; }));
+  });
+  document.getElementById('hideAllBtn').addEventListener('click', function() {
+    applyChanges(allSheetIds.map(function(id) { return { id: id, hidden: true }; }));
+  });
+  document.getElementById('undoBtn').addEventListener('click', function() {
+    var entry = undoStack.pop();
+    if (!entry) return;
+    entry.forEach(function(change) {
+      setHidden(change.id, change.prevHidden);
+    });
+  });
+  document.getElementById('togglePanelBtn').addEventListener('click', function() {
+    var listVisible = checkboxContainer.style.display !== 'none';
+    checkboxContainer.style.display = listVisible ? 'none' : 'block';
+    document.getElementById('showAllBtn').style.display = listVisible ? 'none' : 'inline';
+    document.getElementById('hideAllBtn').style.display = listVisible ? 'none' : 'inline';
+    document.getElementById('undoBtn').style.display = listVisible ? 'none' : 'inline';
+    this.innerText = listVisible ? '[show list]' : '[hide list]';
+  });
+
+  // --- Search / highlight ---
+  var sheetListEl = document.getElementById('sheetList');
+  allSheetIds.slice().sort().forEach(function(id) {
+    var opt = document.createElement('option');
+    opt.value = id;
+    sheetListEl.appendChild(opt);
+  });
+
+  var highlightState = null; // { id, originalColor, originalBorderWidth }
+
+  function clearHighlight() {
+    if (highlightState) {
+      nodes.update({
+        id: highlightState.id,
+        color: highlightState.originalColor,
+        borderWidth: highlightState.originalBorderWidth
+      });
+      highlightState = null;
+    }
+  }
+
+  function highlightSheet(rawName) {
+    clearHighlight();
+    var name = (rawName || '').trim();
+    if (!name) return false;
+    var lower = name.toLowerCase();
+    var match = allSheetIds.find(function(id) { return id.toLowerCase() === lower; });
+    if (!match) {
+      match = allSheetIds.find(function(id) { return id.toLowerCase().indexOf(lower) !== -1; });
+    }
+    if (!match) return false;
+
+    setHidden(match, false); // make sure it's actually visible before focusing it
+
+    var node = nodes.get(match);
+    var baseColor = (typeof node.color === 'string') ? node.color : (node.color && node.color.background) || '#2a9d8f';
+    highlightState = { id: match, originalColor: node.color, originalBorderWidth: node.borderWidth || 1 };
+
+    nodes.update({
+      id: match,
+      borderWidth: 6,
+      color: { background: baseColor, border: '#ff0055', highlight: { background: baseColor, border: '#ff0055' } }
+    });
+
+    network.selectNodes([match]);
+    network.focus(match, { scale: 1.3, animation: { duration: 500, easingFunction: 'easeInOutQuad' } });
+    return match;
+  }
+
+  function runSearch() {
+    var val = document.getElementById('searchBox').value;
+    var statusEl = document.getElementById('status');
+    var found = highlightSheet(val);
+    statusEl.innerText = found ? ('Found: ' + found) : ('No sheet matching "' + val + '"');
+  }
+
+  document.getElementById('searchGoBtn').addEventListener('click', runSearch);
+  document.getElementById('searchBox').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') runSearch();
+  });
+  document.getElementById('searchBox').addEventListener('input', function(e) {
+    if (e.target.value.trim() === '') clearHighlight();
+  });
+</script>
+</body>
+</html>
+"""
+
+
+def nav_html(view_keys, active_key):
+    """
+    Simple top nav bar linking every generated view. view_keys is an
+    ordered list of (url, label) pairs; active_key's matching url gets
+    highlighted. Returns '' (no bar at all) if there's only one view,
+    since a nav bar with a single link is just clutter.
+    """
+    if len(view_keys) <= 1:
+        return ""
+    links = []
+    for url, label in view_keys:
+        cls = ' class="active"' if url == active_key else ""
+        links.append(f'<a href="{url}"{cls}>{label}</a>')
+    return '<div id="navBar">' + "".join(links) + "</div>"
+
+
+def build_html(flow, min_cells, classification=None, nav=""):
+    """
+    classification, if given ({sheet: system}), colors nodes by system
+    instead of by root/leaf/middle position, and adds the system name to
+    each node's tooltip -- this is what lets the full sheet-level view
+    also show, at a glance, how systems join (e.g. a Corptax-colored node
+    with incoming edges from both blue SAP nodes and purple Longview
+    nodes).
+    """
+    strong = {k: v for k, v in flow.items() if v >= min_cells}
+    if not strong:
+        return None
+
+    all_sheets = set()
+    has_incoming = set()
+    has_outgoing = set()
+    for src, dst in strong:
+        all_sheets.add(src)
+        all_sheets.add(dst)
+        has_outgoing.add(src)
+        has_incoming.add(dst)
+
+    roots = all_sheets - has_incoming
+    leaves = all_sheets - has_outgoing
+
+    nodes = []
+    for sheet in all_sheets:
+        system = classification.get(sheet) if classification else None
+        if system:
+            color = system_color(system)
+            title = f"{sheet}\\nSystem: {system}\\nClick to switch to this sheet in Excel"
+        elif sheet in roots:
+            color = "#2ecc71"
+            title = f"{sheet}\\nClick to switch to this sheet in Excel"
+        elif sheet in leaves:
+            color = "#f39c12"
+            title = f"{sheet}\\nClick to switch to this sheet in Excel"
+        else:
+            color = "#2a9d8f"
+            title = f"{sheet}\\nClick to switch to this sheet in Excel"
+        nodes.append({
+            "id": sheet, "label": sheet, "color": color,
+            "shape": "box", "size": 25, "clickable": True,
+            "title": title,
+        })
+
+    max_count = max(strong.values())
+    edges = []
+    for (src, dst), count in strong.items():
+        width = 1 + (count / max_count) * 8
+        edges.append({
+            "from": src, "to": dst, "value": width,
+            "label": str(count), "title": f"{count} formula cells"
+        })
+
+    hint_extra = (
+        "Colored by system. Click a sheet to switch to it in Excel.<br>"
+        if classification else
+        "Green = input sheet, orange = output sheet, teal = in-between.<br>"
+    )
+    html = HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)).replace("__EDGES__", json.dumps(edges))
+    html = html.replace("__NAV__", nav)
+    html = html.replace(
+        "Green = input sheet, orange = output sheet, teal = in-between.<br>",
+        hint_extra,
+    )
+    return html
+
+
+def build_system_overview_flow(flow, classification):
+    """
+    Rolls sheet-level links up to system-level links, dropping links
+    where both ends are in the same system (those belong in the
+    per-system view instead) or where either end has no classification
+    (goes to 'Unclassified' rather than being silently dropped, so
+    unlabeled tabs are still visible as a signal that something needs
+    classifying).
+    """
+    system_flow = {}
+    for (src, dst), count in flow.items():
+        src_sys = classification.get(src, "Unclassified")
+        dst_sys = classification.get(dst, "Unclassified")
+        if src_sys == dst_sys:
+            continue
+        key = (src_sys, dst_sys)
+        system_flow[key] = system_flow.get(key, 0) + count
+    return system_flow
+
+
+def build_system_overview_html(flow, classification, nav=""):
+    """
+    Whole-workbook view collapsed to one node per system. This is where
+    joins are most visible -- e.g. a Corptax node with incoming edges
+    from both SAP_TB and Longview shows exactly how those two systems'
+    outputs converge before filing. Nodes aren't clickable (no single
+    sheet to open for a whole system).
+    """
+    system_flow = build_system_overview_flow(flow, classification)
+    if not system_flow:
+        return None
+
+    systems = sorted(set(s for pair in system_flow for s in pair))
+    nodes = [
+        {
+            "id": sys_, "label": sys_, "color": system_color(sys_),
+            "shape": "box", "size": 35, "clickable": False,
+            "title": f"{sys_}\\n(system-level view -- not a single sheet)",
+            "font": {"size": 20},
+        }
+        for sys_ in systems
+    ]
+
+    max_count = max(system_flow.values())
+    edges = []
+    for (src, dst), count in system_flow.items():
+        width = 1 + (count / max_count) * 10
+        edges.append({
+            "from": src, "to": dst, "value": width,
+            "label": str(count), "title": f"{count} cross-sheet formula cells feed {dst} from {src}",
+        })
+
+    html = HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)).replace("__EDGES__", json.dumps(edges))
+    html = html.replace("__NAV__", nav)
+    html = html.replace(
+        "Green = input sheet, orange = output sheet, teal = in-between.<br>",
+        "System-level view: each box is a whole system, arrows show how they feed each other. "
+        "Not clickable -- switch to a sheet-level view to open specific tabs.<br>",
+    )
+    return html
+
+
+def build_per_system_flow(flow, classification, target_system):
+    """
+    Filtered view for one system: full internal sheet-to-sheet detail for
+    tabs classified into target_system, PLUS collapsed boundary nodes
+    (e.g. "[Longview]") for anything crossing in from or out to another
+    system, so you see the internal structure without every external
+    tab cluttering it. Returns (nodes_info, edges) where nodes_info maps
+    node id -> {"clickable": bool, "system": str or None}.
+    """
+    nodes_info = {}
+    edges = {}
+
+    def boundary_id(system_name):
+        return f"[{system_name}]"
+
+    for (src, dst), count in flow.items():
+        src_sys = classification.get(src)
+        dst_sys = classification.get(dst)
+
+        if src_sys == target_system and dst_sys == target_system:
+            edge_key = (src, dst)
+            nodes_info.setdefault(src, {"clickable": True, "system": src_sys})
+            nodes_info.setdefault(dst, {"clickable": True, "system": dst_sys})
+        elif dst_sys == target_system and src_sys != target_system:
+            other = src_sys or "Unclassified"
+            edge_key = (boundary_id(other), dst)
+            nodes_info.setdefault(boundary_id(other), {"clickable": False, "system": other})
+            nodes_info.setdefault(dst, {"clickable": True, "system": dst_sys})
+        elif src_sys == target_system and dst_sys != target_system:
+            other = dst_sys or "Unclassified"
+            edge_key = (src, boundary_id(other))
+            nodes_info.setdefault(src, {"clickable": True, "system": src_sys})
+            nodes_info.setdefault(boundary_id(other), {"clickable": False, "system": other})
+        else:
+            continue
+
+        edges[edge_key] = edges.get(edge_key, 0) + count
+
+    return nodes_info, edges
+
+
+def build_per_system_html(flow, classification, target_system, nav=""):
+    nodes_info, edges = build_per_system_flow(flow, classification, target_system)
+    if not edges:
+        return None
+
+    nodes = []
+    for node_id, info in nodes_info.items():
+        is_boundary = not info["clickable"]
+        color = system_color(info["system"]) if info["system"] else "#888888"
+        nodes.append({
+            "id": node_id, "label": node_id, "color": color,
+            "shape": "diamond" if is_boundary else "box",
+            "size": 22 if is_boundary else 25,
+            "clickable": info["clickable"],
+            "title": (
+                f"{node_id}\\n(external -- belongs to {info['system']})" if is_boundary
+                else f"{node_id}\\nClick to switch to this sheet in Excel"
+            ),
+        })
+
+    max_count = max(edges.values())
+    edge_list = []
+    for (src, dst), count in edges.items():
+        width = 1 + (count / max_count) * 8
+        edge_list.append({
+            "from": src, "to": dst, "value": width,
+            "label": str(count), "title": f"{count} formula cells",
+        })
+
+    html = HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)).replace("__EDGES__", json.dumps(edge_list))
+    html = html.replace("__NAV__", nav)
+    html = html.replace(
+        "Green = input sheet, orange = output sheet, teal = in-between.<br>",
+        f"{target_system} internal flow. Diamonds = other systems this connects to "
+        f"(not individually clickable) -- boxes are real sheets in {target_system}.<br>",
+    )
+    return html
+
+
+class Handler(BaseHTTPRequestHandler):
+    views = {}          # url path -> html string
+    default_view = "/"
+    workbook_path = ""
+    precedent_cells = {}
+    dependent_cells = {}
+
+    def log_message(self, format, *args):
+        pass  # keep the terminal quiet
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/":
+            content = Handler.views.get(Handler.default_view)
+        else:
+            content = Handler.views.get(parsed.path)
+
+        if content is not None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(content.encode("utf-8"))
+        elif parsed.path == "/open":
+            qs = parse_qs(parsed.query)
+            sheet = qs.get("sheet", [None])[0]
+            want_precedents = qs.get("precedents", ["true"])[0].lower() == "true"
+            want_dependents = qs.get("dependents", ["true"])[0].lower() == "true"
+            status = "ok"
+            try:
+                pre = sorted(Handler.precedent_cells.get(sheet, [])) if want_precedents else []
+                dep = sorted(Handler.dependent_cells.get(sheet, [])) if want_dependents else []
+                result = open_sheet_in_excel(Handler.workbook_path, sheet, precedent_cells=pre, dependent_cells=dep)
+                notes = []
+                if result and result.get("precedents_truncated"):
+                    notes.append("precedents capped at 300")
+                if result and result.get("dependents_truncated"):
+                    notes.append("dependents capped at 300")
+                if notes:
+                    status = "ok (" + ", ".join(notes) + ")"
+            except Exception as e:
+                status = str(e)
+                print(f"[!] Could not open sheet '{sheet}' in Excel: {e}")
+                import traceback
+                traceback.print_exc()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(status.encode("utf-8"))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python sheet_tree_server.py <workbook.xlsx> [min_cells] [--classification tab_classification.xlsx]")
+        print("No file argument given - exiting rather than opening a hardcoded sample.")
+        sys.exit(1)
+
+    args = sys.argv[1:]
+    classification_path = None
+    if "--classification" in args:
+        idx = args.index("--classification")
+        try:
+            classification_path = args[idx + 1]
+        except IndexError:
+            print("--classification requires a file path after it.")
+            sys.exit(1)
+        del args[idx:idx + 2]
+
+    path = args[0]
+    min_cells = DEFAULT_MIN_CELLS
+    if len(args) >= 2:
+        try:
+            min_cells = int(args[1])
+        except ValueError:
+            pass
+
+    classification = {}
+    if classification_path:
+        try:
+            classification = load_classification(classification_path)
+            print(f"Loaded classification for {len(classification)} sheet(s) from {classification_path}.")
+        except Exception as e:
+            print(f"[!] Could not load classification file: {e}")
+            print("Continuing without system-level views.")
+
+    formulas, sheetnames, sheet_bounds = load_formulas(path)
+    print(f"Loaded {len(formulas)} formulas across {len(sheetnames)} sheet(s).")
+
+    flow, precedent_cells, dependent_cells = build_sheet_flow(formulas, sheet_bounds, min_cells=min_cells)
+    print(f"Found {len(flow)} distinct sheet-to-sheet links. Showing links with {min_cells}+ cells.")
+
+    if classification:
+        unclassified = [s for s in sheetnames if s not in classification]
+        if unclassified:
+            print(f"Note: {len(unclassified)} sheet(s) have no classification entry and will show as 'Unclassified' in system views.")
+
+    # Write the companion trace-data workbook regardless of min_cells -
+    # this export uses ALL links found, not just the ones strong enough
+    # to be drawn in the diagram, so it's a complete record.
+    base, _ext = os.path.splitext(os.path.abspath(path))
+    trace_output_path = base + "_trace_data.xlsx"
+    try:
+        export_trace_to_excel(formulas, sheet_bounds, flow, sheetnames, trace_output_path)
+        print(f"Wrote sheet trace data to {trace_output_path}")
+    except Exception as e:
+        print(f"[!] Could not write trace data Excel file: {e}")
+
+    # Build the nav bar's link list first (needed by every view), then
+    # generate each view with that same nav so they all link to each other.
+    nav_links = [("/view/all", "All Sheets")]
+    if classification:
+        nav_links.insert(0, ("/view/overview", "System Overview"))
+        for sys_ in sorted(set(classification.values())):
+            nav_links.append((f"/view/system/{sys_}", sys_))
+
+    views = {}
+
+    all_html = build_html(flow, min_cells, classification=classification or None, nav=nav_html(nav_links, "/view/all"))
+    if all_html is None:
+        print(f"No links with {min_cells}+ cells found - nothing to draw. Try a lower threshold.")
+        return
+    views["/view/all"] = all_html
+
+    default_view = "/view/all"
+
+    if classification:
+        overview_html = build_system_overview_html(flow, classification, nav=nav_html(nav_links, "/view/overview"))
+        if overview_html:
+            views["/view/overview"] = overview_html
+            default_view = "/view/overview"
+        else:
+            print("Note: no cross-system links found for the System Overview -- check that references between systems actually exist in this workbook.")
+
+        for sys_ in sorted(set(classification.values())):
+            sys_html = build_per_system_html(flow, classification, sys_, nav=nav_html(nav_links, f"/view/system/{sys_}"))
+            if sys_html:
+                views[f"/view/system/{sys_}"] = sys_html
+            else:
+                print(f"Note: no links found for system '{sys_}' -- skipping its view.")
+
+    Handler.views = views
+    Handler.default_view = default_view
+    Handler.workbook_path = path
+    Handler.precedent_cells = precedent_cells
+    Handler.dependent_cells = dependent_cells
+
+    server = HTTPServer(("127.0.0.1", PORT), Handler)
+    actual_port = server.server_address[1]
+    url = f"http://127.0.0.1:{actual_port}/"
+    print(f"\nServing at {url}")
+    if classification:
+        print("Views: System Overview (default), All Sheets, and one per system -- use the nav bar at the top to switch.")
+    print("Opening it in your browser now. Leave this window open while you use it - press Ctrl+C here to stop.")
+    print("Clicking a real sheet box draws Trace Precedents arrows (what feeds it) AND Trace Dependents arrows")
+    print("(what it feeds). System/boundary boxes in the overview and per-system views aren't clickable.")
+    threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+if __name__ == "__main__":
+    main()
