@@ -510,6 +510,47 @@ def classify_and_assemble(root_sheet, traced_edges, fallback_edges, final_output
     }
 
 
+def get_downstream_lineage(lineage: dict, start_sheet: str):
+    """
+    Returns a lineage-shaped SUBGRAPH: start_sheet plus everything it
+    feeds into, forward, all the way to the root -- following the
+    relationship edges (not just each node's single primary parent, so
+    branches that merge back together downstream are still captured
+    correctly). Same {filing_reference, final_output, nodes,
+    relationships} shape as the full lineage, so it can go through the
+    exact same Excel/JSON/visual export functions unmodified.
+
+    Returns None if start_sheet isn't in this lineage at all.
+    """
+    node_map = {n["sheet_name"]: n for n in lineage["nodes"]}
+    if start_sheet not in node_map:
+        return None
+
+    forward = {}  # src -> [dst, ...]
+    for r in lineage["relationships"]:
+        forward.setdefault(r["source"], []).append(r["target"])
+
+    visited_nodes = {start_sheet}
+    visited_edges = []
+    frontier = [start_sheet]
+    while frontier:
+        next_frontier = []
+        for current in frontier:
+            for dst in forward.get(current, []):
+                visited_edges.append((current, dst))
+                if dst not in visited_nodes:
+                    visited_nodes.add(dst)
+                    next_frontier.append(dst)
+        frontier = next_frontier
+
+    return {
+        "filing_reference": lineage["filing_reference"],
+        "final_output": lineage["final_output"],
+        "nodes": [node_map[s] for s in visited_nodes if s in node_map],
+        "relationships": [{"source": s, "target": d, "relationship": "feeds"} for s, d in visited_edges],
+    }
+
+
 # ---------------------------------------------------------------------------
 # EXPORT HELPERS
 # ---------------------------------------------------------------------------
@@ -791,6 +832,55 @@ def run_app():
                 "Download JSON", data=json.dumps(lineage, indent=2),
                 file_name="filing_lineage.json", mime="application/json",
             )
+
+        st.divider()
+        st.subheader("6. Downstream flow from an input sheet")
+        input_sources = sorted(n["sheet_name"] for n in lineage["nodes"] if n["classification"] == "Input source")
+
+        if not input_sources:
+            st.info("No sheets are currently classified as Input source in this lineage.")
+        else:
+            selected_input = st.selectbox("Pick an input sheet to trace forward to the filing output:", input_sources)
+            downstream = get_downstream_lineage(lineage, selected_input)
+
+            if downstream is None or len(downstream["nodes"]) <= 1:
+                st.warning(f"'{selected_input}' doesn't lead anywhere further in this lineage -- no downstream path found.")
+            else:
+                reaches_root = lineage["filing_reference"] in {n["sheet_name"] for n in downstream["nodes"]}
+                if reaches_root:
+                    st.success(f"Path from '{selected_input}' reaches the filing output through {len(downstream['nodes'])} sheet(s).")
+                else:
+                    st.warning(f"'{selected_input}' feeds {len(downstream['nodes']) - 1} sheet(s), but the path doesn't reach the filing output in this lineage.")
+
+                down_col1, down_col2 = st.columns(2)
+                with down_col1:
+                    st.dataframe(pd.DataFrame(downstream["nodes"]), use_container_width=True, hide_index=True)
+                with down_col2:
+                    st.dataframe(pd.DataFrame(downstream["relationships"]), use_container_width=True, hide_index=True)
+
+                dd_col1, dd_col2, dd_col3 = st.columns(3)
+                with dd_col1:
+                    st.download_button(
+                        "Download this path (xlsx)", data=lineage_to_excel_bytes(downstream),
+                        file_name=f"downstream_from_{selected_input}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="downstream_xlsx",
+                    )
+                with dd_col2:
+                    if st.button("Open this path's visual in new tab", key="downstream_visual"):
+                        html = build_lineage_visual_html(downstream)
+                        tmpdir = tempfile.mkdtemp(prefix="filing_lineage_downstream_")
+                        html_path = os.path.join(tmpdir, "downstream_visual.html")
+                        with open(html_path, "w", encoding="utf-8") as f:
+                            f.write(html)
+                        webbrowser.open(f"file://{html_path}")
+                        st.success("Opened in a new browser tab.")
+                with dd_col3:
+                    st.download_button(
+                        "Download this path (json)", data=json.dumps(downstream, indent=2),
+                        file_name=f"downstream_from_{selected_input}.json", mime="application/json",
+                        key="downstream_json",
+                    )
 
 
 if __name__ == "__main__":
