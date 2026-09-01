@@ -1,0 +1,706 @@
+"""
+Streamlit dashboard for end-to-end lineage discovery -- calibrated
+multi-signal tab classification.
+
+Classifies each tab against reference tabs using up to three signals:
+  1. column name similarity (fuzzy match)
+  2. cell value overlap (Jaccard on unique values per column)
+  3. cell formula signature (optional, slower -- function names + referenced
+     sheet names used in formulas, compared the same way as values)
+
+Instead of a hand-picked blend, weights are CALIBRATED from your reference
+tabs: for each system with 2+ reference tabs, each signal is tested via
+leave-one-out (does it correctly recognize a held-out reference as more
+similar to its own system's other references than to any other system's?).
+Signals that pass this test more often get more weight. The calibration
+result (per-signal accuracy) is shown in the UI, not hidden -- that's what
+keeps a blended score legible instead of a black box.
+
+Run with:
+    streamlit run lineage_dashboard.py
+"""
+
+import io
+import re
+import itertools
+import os
+import sys
+import subprocess
+import tempfile
+
+import pandas as pd
+import streamlit as st
+from rapidfuzz import fuzz
+
+try:
+    import openpyxl
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+
+
+SYSTEM_LABELS = ["SAP_TB", "ERS", "DTTU", "Longview", "Corptax", "Filing"]
+
+SYSTEM_NAME_ALIASES = {
+    "SAP_TB":   ["sap", "tb", "trial balance", "sap tb", "gl extract"],
+    "ERS":      ["ers", "estimated return summary"],
+    "DTTU":     ["dttu", "deferred tax true up", "deferred tax true-up", "true up", "true-up"],
+    "Longview": ["longview", "lv", "lv upload", "upload template", "consolidation"],
+    "Corptax":  ["corptax", "corp tax", "ctx", "corptax import"],
+    "Filing":   ["filing", "return", "schedule", "tax return", "filed"],
+}
+
+MAX_COLS_FOR_CLASSIFICATION = 15
+MAX_ROWS_FOR_VALUE_MATCH = 300
+MAX_ROWS_FOR_FORMULA_SCAN = 100
+
+DEFAULT_WEIGHTS = {"name": 0.25, "value": 0.75, "formula": 0.0}
+
+
+# ---------------------------------------------------------------------------
+# SIGNAL 1 & 2: column name + value overlap
+# ---------------------------------------------------------------------------
+
+def value_overlap_score(series_a: pd.Series, series_b: pd.Series) -> float:
+    set_a = set(series_a.dropna().astype(str).str.strip().str.upper())
+    set_b = set(series_b.dropna().astype(str).str.strip().str.upper())
+    if not set_a or not set_b:
+        return 0.0
+    smaller = min(len(set_a), len(set_b))
+    return (len(set_a & set_b) / smaller) if smaller else 0.0
+
+
+def tab_similarity(df_a: pd.DataFrame, df_b: pd.DataFrame):
+    """Returns (name_similarity, value_similarity), each 0-100."""
+    cols_a = list(df_a.columns)[:MAX_COLS_FOR_CLASSIFICATION]
+    cols_b = list(df_b.columns)[:MAX_COLS_FOR_CLASSIFICATION]
+    if not cols_a or not cols_b:
+        return 0.0, 0.0
+
+    name_scores = [
+        max((fuzz.token_sort_ratio(str(ca), str(cb)) for cb in cols_b), default=0)
+        for ca in cols_a
+    ]
+    name_sim = sum(name_scores) / len(name_scores)
+
+    sample_a = df_a[cols_a].head(MAX_ROWS_FOR_VALUE_MATCH)
+    sample_b = df_b[cols_b].head(MAX_ROWS_FOR_VALUE_MATCH)
+    value_scores = []
+    for ca in cols_a:
+        best_val = 0.0
+        for cb in cols_b:
+            try:
+                score = value_overlap_score(sample_a[ca], sample_b[cb])
+            except Exception:
+                score = 0.0
+            best_val = max(best_val, score)
+        value_scores.append(best_val)
+    value_sim = (sum(value_scores) / len(value_scores)) * 100 if value_scores else 0.0
+
+    return round(name_sim), round(value_sim)
+
+
+# ---------------------------------------------------------------------------
+# SIGNAL 3 (optional): cell formulas
+# ---------------------------------------------------------------------------
+
+FUNC_TOKEN_RE = re.compile(r'([A-Z][A-Z0-9\.]{2,})\(')
+SHEET_REF_RE = re.compile(r"(?:'([^']+)'|\b([A-Za-z0-9_]+))!")
+
+
+def formula_tokens(formula: str) -> set:
+    """Extract function names and referenced sheet names from a formula string."""
+    tokens = set()
+    upper = formula.upper()
+    for fn in FUNC_TOKEN_RE.findall(upper):
+        tokens.add(f"FN:{fn}")
+    for m in SHEET_REF_RE.findall(formula):
+        sheet = (m[0] or m[1])
+        if sheet:
+            tokens.add(f"REF:{sheet.upper()}")
+    return tokens
+
+
+def column_formula_signature(ws, ncols: int, nrows: int):
+    """Returns list of token-sets, one per column position (1-indexed data starts row 2)."""
+    sig = []
+    max_col = min(ncols, ws.max_column or 0)
+    max_row = min(nrows + 1, ws.max_row or 0)
+    for j in range(1, max_col + 1):
+        col_tokens = set()
+        for i in range(2, max_row + 1):
+            cell = ws.cell(row=i, column=j)
+            if cell.data_type == "f" and isinstance(cell.value, str):
+                col_tokens |= formula_tokens(cell.value)
+        sig.append(col_tokens)
+    return sig
+
+
+def formula_similarity(sig_a: list, sig_b: list) -> float:
+    if not sig_a or not sig_b:
+        return 0.0
+    scores = []
+    for set_a in sig_a:
+        best = 0.0
+        for set_b in sig_b:
+            if set_a and set_b:
+                overlap = len(set_a & set_b) / len(set_a | set_b)
+                best = max(best, overlap)
+        scores.append(best)
+    return (sum(scores) / len(scores)) * 100 if scores else 0.0
+
+
+# ---------------------------------------------------------------------------
+# CALIBRATION -- leave-one-out on reference tabs to derive signal weights
+# ---------------------------------------------------------------------------
+
+def calibrate_weights(reference_dfs: dict, reference_formula_sigs: dict, use_formula: bool):
+    """
+    reference_dfs: {system: [df, df, ...]}
+    reference_formula_sigs: {system: [sig, sig, ...]} aligned by index, or {} if unused.
+
+    For each system with 2+ reference tabs, hold out one at a time and check
+    whether each signal alone ranks it closer to its own system's remaining
+    references than to any other system's references. Returns calibrated
+    weights, per-signal accuracy, and a note explaining what happened.
+    """
+    signals = ["name", "value"] + (["formula"] if use_formula else [])
+    correct = {s: 0 for s in signals}
+    total_trials = 0
+
+    systems_with_pairs = [s for s, refs in reference_dfs.items() if len(refs) >= 2]
+    if not systems_with_pairs:
+        return dict(DEFAULT_WEIGHTS), {}, (
+            "Not enough same-system reference tabs to calibrate (need 2+ per system for at "
+            "least one system). Using default weights: 75% value overlap / 25% column names. "
+            "Add a second reference tab to any system to enable calibration."
+        )
+
+    for system in systems_with_pairs:
+        refs = reference_dfs[system]
+        f_sigs = reference_formula_sigs.get(system, [None] * len(refs)) if use_formula else [None] * len(refs)
+        other_refs = [(s2, i2) for s2, r2 in reference_dfs.items() if s2 != system for i2 in range(len(r2))]
+        if not other_refs:
+            continue
+
+        for idx in range(len(refs)):
+            held_out = refs[idx]
+            held_out_fsig = f_sigs[idx]
+            others_same = [refs[j] for j in range(len(refs)) if j != idx]
+            others_same_fsig = [f_sigs[j] for j in range(len(refs)) if j != idx]
+            other_sys_dfs = [reference_dfs[s2][i2] for s2, i2 in other_refs]
+            other_sys_fsigs = [reference_formula_sigs.get(s2, [None] * len(reference_dfs[s2]))[i2] for s2, i2 in other_refs] if use_formula else [None] * len(other_refs)
+
+            total_trials += 1
+            name_scores_same, value_scores_same, formula_scores_same = [], [], []
+            for o in others_same:
+                n, v = tab_similarity(held_out, o)
+                name_scores_same.append(n)
+                value_scores_same.append(v)
+            for fsig_o in others_same_fsig:
+                if use_formula and held_out_fsig and fsig_o:
+                    formula_scores_same.append(formula_similarity(held_out_fsig, fsig_o))
+
+            name_scores_diff, value_scores_diff, formula_scores_diff = [], [], []
+            for o in other_sys_dfs:
+                n, v = tab_similarity(held_out, o)
+                name_scores_diff.append(n)
+                value_scores_diff.append(v)
+            for fsig_o in other_sys_fsigs:
+                if use_formula and held_out_fsig and fsig_o:
+                    formula_scores_diff.append(formula_similarity(held_out_fsig, fsig_o))
+
+            if max(name_scores_same, default=0) > max(name_scores_diff, default=0):
+                correct["name"] += 1
+            if max(value_scores_same, default=0) > max(value_scores_diff, default=0):
+                correct["value"] += 1
+            if use_formula:
+                same_f = max(formula_scores_same, default=0)
+                diff_f = max(formula_scores_diff, default=0)
+                if same_f > diff_f:
+                    correct["formula"] += 1
+
+    if total_trials == 0:
+        return dict(DEFAULT_WEIGHTS), {}, "Calibration trials found no valid pairs -- using default weights."
+
+    accuracy = {s: correct[s] / total_trials for s in signals}
+    total_acc = sum(accuracy.values())
+    if total_acc == 0:
+        weights = {s: 1 / len(signals) for s in signals}
+        note = f"Calibrated over {total_trials} trials, but no signal discriminated correctly -- falling back to an equal split. Your reference tabs may need review."
+    else:
+        weights = {s: accuracy[s] / total_acc for s in signals}
+        note = f"Calibrated over {total_trials} leave-one-out trial(s) across {len(systems_with_pairs)} system(s) with multiple references."
+
+    for s in ["name", "value", "formula"]:
+        weights.setdefault(s, 0.0)
+    return weights, accuracy, note
+
+
+def pick_single_best_signal(weights: dict) -> dict:
+    """Hard-select mode: winner takes all weight."""
+    best = max(weights, key=weights.get)
+    return {s: (1.0 if s == best else 0.0) for s in weights}
+
+
+# ---------------------------------------------------------------------------
+# CLASSIFICATION using calibrated weights
+# ---------------------------------------------------------------------------
+
+def classify_tab(df, formula_sig, reference_dfs: dict, reference_formula_sigs: dict,
+                  weights: dict, use_formula: bool):
+    best_system, best_combined = "Unassigned", -1
+    best_breakdown = {"name": 0, "value": 0, "formula": 0}
+
+    for system, refs in reference_dfs.items():
+        f_sigs = reference_formula_sigs.get(system, [None] * len(refs)) if use_formula else [None] * len(refs)
+        name_best, value_best, formula_best = 0, 0, 0
+        for i, ref_df in enumerate(refs):
+            n, v = tab_similarity(df, ref_df)
+            name_best = max(name_best, n)
+            value_best = max(value_best, v)
+            if use_formula and formula_sig and f_sigs[i]:
+                formula_best = max(formula_best, formula_similarity(formula_sig, f_sigs[i]))
+
+        combined = (
+            weights.get("name", 0) * name_best
+            + weights.get("value", 0) * value_best
+            + weights.get("formula", 0) * formula_best
+        )
+        if combined > best_combined:
+            best_system, best_combined = system, combined
+            best_breakdown = {"name": name_best, "value": value_best, "formula": formula_best}
+
+    return best_system, round(max(best_combined, 0)), best_breakdown
+
+
+# ---------------------------------------------------------------------------
+# LINEAGE MATCHING LOGIC (system-level, after classification -- unchanged)
+# ---------------------------------------------------------------------------
+
+def match_headers(df_a: pd.DataFrame, df_b: pd.DataFrame, threshold: int):
+    matches = []
+    used_targets = set()
+    for col_a in df_a.columns:
+        best_score, best_col_b, best_method = 0, None, None
+        for col_b in df_b.columns:
+            if col_b in used_targets:
+                continue
+            sort_score = fuzz.token_sort_ratio(str(col_a), str(col_b))
+            partial_score = fuzz.partial_ratio(str(col_a), str(col_b))
+            score, method = max((sort_score, "token_sort"), (partial_score, "partial"))
+            if score > best_score:
+                best_score, best_col_b, best_method = score, col_b, method
+        if best_score >= threshold:
+            matches.append({"source_field": col_a, "target_field": best_col_b, "score": best_score, "method": f"name:{best_method}"})
+            used_targets.add(best_col_b)
+    return matches
+
+
+def match_by_values(df_a: pd.DataFrame, df_b: pd.DataFrame, already_matched_targets: set, threshold: float):
+    matches = []
+    used_targets = set(already_matched_targets)
+    for col_a in df_a.columns:
+        best_score, best_col_b = 0.0, None
+        for col_b in df_b.columns:
+            if col_b in used_targets:
+                continue
+            if df_a[col_a].dtype.kind not in "OUS" and df_b[col_b].dtype.kind in "OUS":
+                continue
+            score = value_overlap_score(df_a[col_a], df_b[col_b])
+            if score > best_score:
+                best_score, best_col_b = score, col_b
+        if best_score >= threshold:
+            matches.append({"source_field": col_a, "target_field": best_col_b, "score": round(best_score * 100, 1), "method": "value_overlap"})
+            used_targets.add(best_col_b)
+    return matches
+
+
+def field_level_mapping(df_a, df_b, source_system, target_system, header_threshold, value_threshold):
+    header_matches = match_headers(df_a, df_b, header_threshold)
+    matched_targets = {m["target_field"] for m in header_matches}
+    value_matches = match_by_values(df_a, df_b, matched_targets, value_threshold)
+    all_matches = header_matches + value_matches
+    matched_targets |= {m["target_field"] for m in value_matches}
+
+    rows = []
+    for m in all_matches:
+        rows.append({
+            "Source System": source_system, "Source Field": m["source_field"],
+            "Transformation": "direct" if m["score"] >= 95 else "mapped/renamed",
+            "Target System": target_system, "Target Field": m["target_field"],
+            "Adjustment Type": "", "Match Confidence": m["score"],
+            "Match Method": m["method"], "SME Confirmed": "Pending",
+        })
+    for col_b in df_b.columns:
+        if col_b not in matched_targets:
+            rows.append({
+                "Source System": "(none found)", "Source Field": "",
+                "Transformation": "manual/adjustment - unverified",
+                "Target System": target_system, "Target Field": col_b,
+                "Adjustment Type": "Candidate M-1/M-3 or manual entry - CONFIRM WITH SME",
+                "Match Confidence": 0, "Match Method": "no_match", "SME Confirmed": "Pending",
+            })
+    return pd.DataFrame(rows)
+
+
+def pairwise_overlap_report(dfs: dict, header_threshold: int, value_threshold: float, min_matched_fields: int) -> pd.DataFrame:
+    results = []
+    for sys_a, sys_b in itertools.permutations(dfs.keys(), 2):
+        df_a, df_b = dfs[sys_a], dfs[sys_b]
+        header_matches = match_headers(df_a, df_b, header_threshold)
+        matched_targets = {m["target_field"] for m in header_matches}
+        value_matches = match_by_values(df_a, df_b, matched_targets, value_threshold)
+        total = len(header_matches) + len(value_matches)
+        avg_conf = (sum(m["score"] for m in header_matches + value_matches) / total) if total else 0
+        results.append({"From": sys_a, "To": sys_b, "Matched Fields": total, "Avg Confidence": round(avg_conf, 1), "Candidate Edge": total >= min_matched_fields})
+    columns = ["From", "To", "Matched Fields", "Avg Confidence", "Candidate Edge"]
+    if not results:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(results, columns=columns).sort_values(["Candidate Edge", "Matched Fields"], ascending=[False, False]).reset_index(drop=True)
+
+
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+    return buf.getvalue()
+
+
+def build_lineage_diagram(report: pd.DataFrame, confirmed_pair: tuple = None) -> str:
+    edges = report[report["Candidate Edge"]] if not report.empty else report
+    nodes = sorted(set(edges["From"]) | set(edges["To"]))
+    lines = [
+        'digraph lineage {', '  rankdir=LR;',
+        '  node [shape=box, style="rounded,filled", fillcolor="#eaf1fb", fontname="Helvetica", fontsize=11];',
+        '  edge [fontname="Helvetica", fontsize=9];',
+    ]
+    for n in nodes:
+        lines.append(f'  "{n}";')
+    for _, row in edges.iterrows():
+        conf = row["Avg Confidence"]
+        color = "#2e7d32" if conf >= 80 else ("#f9a825" if conf >= 60 else "#c62828")
+        is_selected = confirmed_pair and (row["From"], row["To"]) == confirmed_pair
+        penwidth = 3 if is_selected else 1.5
+        label = f'{int(row["Matched Fields"])} fields, {conf:.0f}%'
+        lines.append(f'  "{row["From"]}" -> "{row["To"]}" [label="{label}", color="{color}", penwidth={penwidth}];')
+    lines.append('}')
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# STREAMLIT UI
+# ---------------------------------------------------------------------------
+
+st.set_page_config(page_title="Lineage Discovery", layout="wide")
+st.title("End-to-End Lineage Discovery")
+st.caption("Upload one workpaper (many tabs) → confirm reference tabs per system → calibrate signal weights → classify → discover connections → build the mapping log.")
+
+with st.sidebar:
+    st.header("Classification signals")
+    use_formula = st.checkbox(
+        "Include cell-formula signal (slower)", value=False,
+        help="Parses actual Excel formulas (function names + referenced sheet names) per column. Adds real signal for computed/derived tabs, but is heavier to run across 100+ tabs.",
+    )
+    if use_formula and not OPENPYXL_AVAILABLE:
+        st.error("openpyxl is required for the formula signal. Install it: pip install openpyxl")
+        use_formula = False
+
+    weighting_mode = st.radio(
+        "How to combine signals",
+        ["Auto-calibrate & blend (recommended)", "Auto-pick single best signal", "Manual"],
+        help="Calibrated modes derive weights from leave-one-out tests on your reference tabs, shown after you set references below -- not hand-tuned.",
+    )
+
+    if weighting_mode == "Manual":
+        st.caption("Manual weights (normalized automatically):")
+        w_name = st.slider("Column name weight", 0, 100, 25)
+        w_value = st.slider("Value overlap weight", 0, 100, 75)
+        w_formula = st.slider("Formula weight", 0, 100, 0) if use_formula else 0
+        _total = max(w_name + w_value + w_formula, 1)
+        manual_weights = {"name": w_name / _total, "value": w_value / _total, "formula": w_formula / _total}
+
+    st.header("Lineage matching sensitivity")
+    header_threshold = st.slider("Header name match threshold", 50, 100, 80)
+    match_value_threshold = st.slider("Field value overlap threshold", 0.0, 1.0, 0.5, 0.05)
+    min_matched_fields = st.slider("Min matched fields to call it a candidate edge", 1, 10, 2)
+
+st.subheader("1. Upload your workpaper")
+workpaper = st.file_uploader("Excel workbook with many tabs", type=["xlsx", "xls"])
+
+if workpaper is not None:
+    if "raw_sheets" not in st.session_state or st.session_state.get("_wp_name") != workpaper.name:
+        with st.spinner("Reading all tabs..."):
+            st.session_state["raw_sheets"] = pd.read_excel(workpaper, sheet_name=None)
+            st.session_state["_wp_name"] = workpaper.name
+            st.session_state.pop("formula_wb", None)
+    raw_sheets = st.session_state["raw_sheets"]
+    st.success(f"Found {len(raw_sheets)} tabs.")
+
+    if use_formula and "formula_wb" not in st.session_state:
+        with st.spinner("Parsing formulas (one-time)..."):
+            workpaper.seek(0)
+            st.session_state["formula_wb"] = openpyxl.load_workbook(workpaper, data_only=False)
+
+    sheet_names = list(raw_sheets.keys())
+
+    st.subheader("2. Confirm reference tabs for each system")
+    st.write(
+        "Select every tab you already trust by name for each system -- multiple is better than one, "
+        "since 2+ per system is what lets the weighting below be calibrated instead of guessed. "
+        "Leave a system empty if you have no confidently-named tab for it."
+    )
+
+    reference_choice = {}
+    ref_cols = st.columns(3)
+    for i, system in enumerate(SYSTEM_LABELS):
+        suggested = [
+            name for name in sheet_names
+            if max(fuzz.partial_ratio(name.lower(), a) for a in SYSTEM_NAME_ALIASES[system]) >= 75
+        ]
+        with ref_cols[i % 3]:
+            choice = st.multiselect(f"{system} reference(s)", sheet_names, default=suggested, key=f"ref_{system}")
+            reference_choice[system] = choice
+
+    reference_dfs = {sys_: [raw_sheets[n] for n in names] for sys_, names in reference_choice.items() if names}
+    reference_sheet_names = {n for names in reference_choice.values() for n in names}
+
+    reference_formula_sigs = {}
+    if use_formula and reference_dfs:
+        wb = st.session_state["formula_wb"]
+        for sys_, names in reference_choice.items():
+            if names:
+                reference_formula_sigs[sys_] = [
+                    column_formula_signature(wb[n], MAX_COLS_FOR_CLASSIFICATION, MAX_ROWS_FOR_FORMULA_SCAN)
+                    for n in names if n in wb.sheetnames
+                ]
+
+    st.divider()
+    st.subheader("3. Calibrate signal weights")
+
+    if st.button("Run calibration", disabled=len(reference_dfs) < 1):
+        weights, accuracy, note = calibrate_weights(reference_dfs, reference_formula_sigs, use_formula)
+        st.session_state["calibrated_weights"] = weights
+        st.session_state["calibration_accuracy"] = accuracy
+        st.session_state["calibration_note"] = note
+
+    if "calibrated_weights" in st.session_state:
+        st.info(st.session_state["calibration_note"])
+        if st.session_state["calibration_accuracy"]:
+            acc_df = pd.DataFrame([
+                {"Signal": s, "Leave-one-out accuracy": f"{a*100:.0f}%", "Calibrated weight": f"{st.session_state['calibrated_weights'][s]*100:.0f}%"}
+                for s, a in st.session_state["calibration_accuracy"].items()
+            ])
+            st.dataframe(acc_df, use_container_width=True, hide_index=True)
+
+    if weighting_mode == "Manual":
+        active_weights = manual_weights
+        st.caption(f"Using manual weights: {', '.join(f'{k}: {v*100:.0f}%' for k, v in active_weights.items())}")
+    elif "calibrated_weights" in st.session_state:
+        base = st.session_state["calibrated_weights"]
+        active_weights = pick_single_best_signal(base) if weighting_mode == "Auto-pick single best signal" else base
+        st.caption(f"Active weights: {', '.join(f'{k}: {v*100:.0f}%' for k, v in active_weights.items())}")
+    else:
+        active_weights = dict(DEFAULT_WEIGHTS)
+        st.caption("Run calibration above, or switch to Manual, before classifying -- using defaults for now.")
+
+    st.divider()
+    st.subheader("4. Classify remaining tabs by content")
+
+    if st.button("Classify all tabs", type="primary", disabled=len(reference_dfs) < 1):
+        rows = []
+        progress = st.progress(0.0, text="Classifying tabs...")
+        non_ref_names = [n for n in sheet_names if n not in reference_sheet_names]
+        wb = st.session_state.get("formula_wb")
+        for i, name in enumerate(non_ref_names):
+            fsig = column_formula_signature(wb[name], MAX_COLS_FOR_CLASSIFICATION, MAX_ROWS_FOR_FORMULA_SCAN) if (use_formula and wb and name in wb.sheetnames) else None
+            guess, confidence, breakdown = classify_tab(
+                raw_sheets[name], fsig, reference_dfs, reference_formula_sigs, active_weights, use_formula
+            )
+            rows.append({
+                "Sheet Name": name, "Rows": len(raw_sheets[name]), "Cols": len(raw_sheets[name].columns),
+                "Guessed System": guess, "Confidence": confidence,
+                "Name Score": breakdown["name"], "Value Score": breakdown["value"], "Formula Score": breakdown["formula"] if use_formula else None,
+                "Final System": guess,
+            })
+            progress.progress((i + 1) / max(len(non_ref_names), 1), text=f"Classifying tabs... ({i + 1}/{len(non_ref_names)})")
+        progress.empty()
+
+        for system, names in reference_choice.items():
+            for name in names:
+                rows.insert(0, {
+                    "Sheet Name": name, "Rows": len(raw_sheets[name]), "Cols": len(raw_sheets[name].columns),
+                    "Guessed System": system, "Confidence": 100,
+                    "Name Score": 100, "Value Score": 100, "Formula Score": 100 if use_formula else None,
+                    "Final System": system,
+                })
+        st.session_state["classification_df"] = pd.DataFrame(rows)
+
+    if "classification_df" in st.session_state:
+        cdf = st.session_state["classification_df"]
+
+        show_low_only = st.checkbox("Show only low-confidence tabs (below 70) needing review", value=True)
+        search = st.text_input("Filter by sheet name contains", "")
+
+        display_df = cdf.copy()
+        if show_low_only:
+            display_df = display_df[display_df["Confidence"] < 70]
+        if search:
+            display_df = display_df[display_df["Sheet Name"].str.contains(search, case=False, na=False)]
+
+        st.write(f"Showing {len(display_df)} of {len(cdf)} tabs. Edit **Final System** directly (type any label, or 'Skip' to exclude).")
+
+        editable_cols = ["Sheet Name", "Rows", "Cols", "Guessed System", "Confidence", "Name Score", "Value Score", "Final System"]
+        if use_formula:
+            editable_cols.insert(-1, "Formula Score")
+
+        edited = st.data_editor(
+            display_df[editable_cols].sort_values("Confidence"),
+            column_config={
+                "Final System": st.column_config.TextColumn("Final System (editable)"),
+                "Confidence": st.column_config.NumberColumn("Confidence", format="%d%%"),
+                "Name Score": st.column_config.NumberColumn("Name Score", format="%d%%"),
+                "Value Score": st.column_config.NumberColumn("Value Score", format="%d%%"),
+                "Formula Score": st.column_config.NumberColumn("Formula Score", format="%d%%"),
+            },
+            disabled=[c for c in editable_cols if c != "Final System"],
+            use_container_width=True,
+            hide_index=True,
+            key="editor",
+        )
+
+        cdf = cdf.set_index("Sheet Name")
+        cdf.update(edited.set_index("Sheet Name")[["Final System"]])
+        cdf = cdf.reset_index()
+        st.session_state["classification_df"] = cdf
+
+        st.download_button("Download full classification (xlsx)", data=to_excel_bytes(cdf), file_name="tab_classification.xlsx")
+
+        st.divider()
+        st.subheader("Launch Sheet Trace Viewer")
+        st.write(
+            "Opens the real formula-based trace tool (`sheet_tree_server.py`) in a new browser tab, "
+            "using this workpaper and your confirmed classification above -- shows System Overview, "
+            "All Sheets, and one drill-down view per system, all wired to actual traced formula "
+            "references (not fuzzy matching)."
+        )
+        st.caption(
+            "Runs **locally only** -- it starts a local server and drives your local Excel via "
+            "COM automation, so it only works if you're running this dashboard on your own Windows "
+            "machine with Excel installed and `sheet_tree_server.py` in the same folder as this script. "
+            "It won't work if this dashboard is hosted remotely."
+        )
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        default_script_path = os.path.join(script_dir, "sheet_tree_server.py")
+        script_path = st.text_input("Path to sheet_tree_server.py", value=default_script_path)
+        trace_min_cells = st.slider("Min cells per link to draw (sheet trace tool)", 1, 20, 1)
+
+        launch_col, stop_col = st.columns(2)
+
+        with launch_col:
+            if st.button("Launch Sheet Trace Viewer", type="primary"):
+                if not os.path.exists(script_path):
+                    st.error(f"Could not find sheet_tree_server.py at: {script_path}. Place it next to this dashboard file or correct the path above.")
+                else:
+                    try:
+                        if "trace_tmpdir" not in st.session_state:
+                            st.session_state["trace_tmpdir"] = tempfile.mkdtemp(prefix="lineage_trace_")
+                        tmpdir = st.session_state["trace_tmpdir"]
+
+                        workbook_path = os.path.join(tmpdir, workpaper.name)
+                        with open(workbook_path, "wb") as f:
+                            f.write(workpaper.getvalue())
+
+                        classification_path = os.path.join(tmpdir, "tab_classification.xlsx")
+                        with open(classification_path, "wb") as f:
+                            f.write(to_excel_bytes(cdf))
+
+                        cmd = [
+                            sys.executable, script_path, workbook_path, str(trace_min_cells),
+                            "--classification", classification_path,
+                        ]
+                        proc = subprocess.Popen(cmd, cwd=tmpdir)
+                        st.session_state["trace_proc"] = proc
+                        st.success(f"Launched (PID {proc.pid}). A new browser tab should open automatically in a moment.")
+                    except Exception as e:
+                        st.error(f"Failed to launch: {e}")
+
+        with stop_col:
+            active_proc = st.session_state.get("trace_proc")
+            if st.button("Stop Sheet Trace Viewer", disabled=active_proc is None or active_proc.poll() is not None):
+                active_proc.terminate()
+                st.info("Stopped.")
+
+        if st.session_state.get("trace_proc") is not None:
+            proc = st.session_state["trace_proc"]
+            if proc.poll() is None:
+                st.caption(f"Trace viewer running (PID {proc.pid}). Use Stop above when you're done with it, or close it from Task Manager if this dashboard restarts.")
+            else:
+                st.caption(f"Trace viewer process exited (code {proc.returncode}).")
+
+        st.divider()
+        st.subheader("5. Discover candidate edges")
+        st.write("Tabs sharing the same Final System are combined into one dataset per system before matching.")
+
+        confirmed = cdf[~cdf["Final System"].isin(["Skip", "", None])]
+        system_dfs = {}
+        for system, group in confirmed.groupby("Final System"):
+            frames = [raw_sheets[n] for n in group["Sheet Name"] if n in raw_sheets]
+            if frames:
+                system_dfs[system] = pd.concat(frames, ignore_index=True, sort=False)
+
+        st.write(f"Systems ready for lineage matching: {list(system_dfs.keys())}")
+
+        if st.button("Run discovery", type="primary", disabled=len(system_dfs) < 2):
+            st.session_state["report"] = pairwise_overlap_report(system_dfs, header_threshold, match_value_threshold, min_matched_fields)
+            st.session_state["dfs"] = system_dfs
+
+        if len(system_dfs) < 2:
+            st.info("Assign at least 2 systems (not Skip) to run discovery.")
+
+        if "report" in st.session_state:
+            report = st.session_state["report"]
+            st.dataframe(
+                report.style.apply(lambda row: ["background-color: #d4f7d4" if row["Candidate Edge"] else "" for _ in row], axis=1),
+                use_container_width=True,
+            )
+            st.download_button("Download edge discovery report (xlsx)", data=to_excel_bytes(report), file_name="lineage_edge_discovery.xlsx")
+
+            st.divider()
+            st.subheader("6. Field-level mapping for a confirmed pair")
+
+            dfs = st.session_state["dfs"]
+            candidate_pairs = report[report["Candidate Edge"]] if not report.empty else report
+            pair_options = [f"{r['From']} -> {r['To']}" for _, r in candidate_pairs.iterrows()] or [f"{r['From']} -> {r['To']}" for _, r in report.iterrows()]
+
+            selected_pair_tuple = None
+            if pair_options:
+                selected = st.selectbox("Choose a pair", pair_options)
+                from_sys, to_sys = selected.split(" -> ")
+
+                if st.button("Generate field-level mapping"):
+                    st.session_state["mapping_df"] = field_level_mapping(dfs[from_sys], dfs[to_sys], from_sys, to_sys, header_threshold, match_value_threshold)
+                    st.session_state["mapping_pair"] = selected
+
+                if "mapping_df" in st.session_state:
+                    selected_pair_tuple = (from_sys, to_sys)
+                    st.write(f"**{st.session_state['mapping_pair']}**")
+                    mapping_df = st.session_state["mapping_df"]
+
+                    def highlight_row(row):
+                        return ["background-color: #fff3cd" for _ in row] if row["Adjustment Type"] else ["" for _ in row]
+
+                    st.dataframe(mapping_df.style.apply(highlight_row, axis=1), use_container_width=True)
+                    st.download_button("Download field mapping (xlsx)", data=to_excel_bytes(mapping_df), file_name=f"lineage_mapping_{from_sys}_to_{to_sys}.xlsx")
+                    n_adj = (mapping_df["Adjustment Type"] != "").sum()
+                    st.caption(f"{len(mapping_df) - n_adj} matched fields, {n_adj} unmatched target fields flagged as candidate adjustments/manual entries - confirm on the SME call.")
+
+            st.divider()
+            st.subheader("7. Lineage diagram")
+            st.write("Green = high confidence (80%+), amber = medium (60-79%), red = weak (below 60%). Selected pair drawn thicker.")
+            dot_source = build_lineage_diagram(report, confirmed_pair=selected_pair_tuple)
+            st.graphviz_chart(dot_source, use_container_width=True)
+            st.download_button("Download diagram source (.dot)", data=dot_source, file_name="lineage_diagram.dot")
+else:
+    st.info("Upload your workpaper Excel file to get started.")
