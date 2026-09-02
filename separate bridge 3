@@ -1,0 +1,305 @@
+"""
+bridge.py
+---------
+Standalone local COM listener for the Filing Lineage diagram.
+
+Run this on its own (or let dashboard.py launch it as a subprocess) on the
+SAME machine that has Excel installed. It does exactly one job: listen on
+localhost for "activate this cell" requests coming from the exported
+lineage diagram's JavaScript (a static HTML file opened in a browser tab)
+and drive Excel via COM to jump there.
+
+Why this has to be a separate process from dashboard.py's own Python
+runtime: the exported diagram is a static file:// page with no live
+connection back to the Streamlit process that generated it. A file:// page
+CAN, however, issue a fetch() to http://127.0.0.1:<port> -- so this script
+exists purely to be "some Python process reachable on localhost" that the
+diagram can call into. It reuses the same COM approach the Streamlit app
+used to use internally (Dispatch -> find-or-open workbook -> activate
+sheet -> select cell), just running standalone and accepting requests over
+HTTP instead of being called as a Python function.
+
+Two real constraints (not solved by code, just documented so they're not
+a surprise later):
+  1. This process (or the one dashboard.py spawns) has to still be RUNNING
+     whenever you click a locate button in an already-open diagram tab.
+     Close it, and clicks silently do nothing until you notice the error
+     toast.
+  2. A file:// page calling http://localhost is a cross-origin request in
+     the browser's eyes (the file:// page's Origin header is "null"), so
+     every response here sends permissive CORS headers, including on the
+     OPTIONS preflight.
+
+Run with:
+    python bridge.py [--port 8765]
+"""
+
+import argparse
+import json
+import os
+import queue
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:
+    import win32com.client as win32  # pywin32 -- Windows only
+    import pythoncom                 # COM apartment init/uninit -- pywin32 -- Windows only
+    _WIN32COM_AVAILABLE = True
+except ImportError:
+    _WIN32COM_AVAILABLE = False
+    pythoncom = None
+
+# Bumped whenever this file's request-handling logic changes in a way that
+# matters to correctness (e.g. the COM-worker-thread fix). dashboard.py
+# checks this via /ping before trusting an already-running bridge process
+# on the port -- otherwise a stale bridge left over from before a code
+# update just keeps answering requests with its old (broken) behavior,
+# and dashboard.py has no way to tell "healthy" from "stale" without this.
+BRIDGE_VERSION = 2
+
+
+# ---------------------------------------------------------------------------
+# COM automation -- same approach as the old locate_cell_in_excel, adapted
+# to work from a FILE PATH instead of raw bytes. The bridge is handed a
+# path (the dashboard writes the uploaded workbook to disk once and shares
+# that path), so there's no need to re-write a temp copy from bytes on
+# every single click the way the original bytes-based version did.
+# ---------------------------------------------------------------------------
+
+# One dict per bridge process, keyed by the path we've already opened a
+# working copy for -- so repeated clicks across a session reuse the same
+# open workbook instead of opening a new Excel window every time.
+_opened_copies = {}
+
+
+def locate_cell_in_excel_by_path(file_path: str, workbook_name_hint: str, sheet_name: str, cell_ref: str):
+    """
+    Jumps to a specific cell in Excel, launching Excel and/or opening the
+    workbook if needed. Returns (ok: bool, message: str).
+
+    Order of operations mirrors the original locate_cell_in_excel:
+      1. win32.Dispatch("Excel.Application") -- get-or-create the running
+         Excel instance (single-instance COM server).
+      2. Look for a workbook already open (in that instance) whose name
+         matches workbook_name_hint -- covers the case where the person
+         already has their real file open and just wants to jump around
+         in it.
+      3. If no match, open file_path directly. Note this may be the
+         person's actual original file (if dashboard.py passes the real
+         upload path) or a temp copy (if it only ever had bytes) --
+         which one it is is entirely up to what path dashboard.py hands
+         over; this function doesn't know or care.
+      4. Cache the opened workbook object by file_path so repeat clicks
+         in the same bridge session reuse it instead of re-opening.
+    """
+    if not _WIN32COM_AVAILABLE:
+        return False, "Needs pywin32 (`pip install pywin32`) and only works on Windows with Excel installed."
+    if not cell_ref:
+        return False, "No cell reference supplied."
+    if not os.path.exists(file_path):
+        return False, f"Workbook path not found on this machine: {file_path}"
+
+    try:
+        excel_app = win32.Dispatch("Excel.Application")
+    except Exception as e:
+        return False, f"Couldn't start or connect to Excel: {e}"
+
+    target_wb = None
+    hint = (workbook_name_hint or "").lower()
+    try:
+        for wb in excel_app.Workbooks:
+            if hint and hint in wb.Name.lower():
+                target_wb = wb
+                break
+    except Exception as e:
+        return False, f"Couldn't inspect open workbooks: {e}"
+
+    if target_wb is None:
+        target_wb = _opened_copies.get(file_path)
+        if target_wb is not None:
+            try:
+                _ = target_wb.Name  # cheap liveness check -- raises if the wb/COM handle died
+            except Exception:
+                target_wb = None
+                _opened_copies.pop(file_path, None)
+
+    if target_wb is None:
+        try:
+            target_wb = excel_app.Workbooks.Open(file_path)
+            _opened_copies[file_path] = target_wb
+        except Exception as e:
+            return False, f"Couldn't open the workbook: {e}"
+
+    try:
+        ws = target_wb.Worksheets(sheet_name)
+    except Exception:
+        return False, f"Sheet '{sheet_name}' wasn't found in the workbook."
+
+    try:
+        excel_app.Visible = True
+        target_wb.Activate()
+        ws.Activate()
+        ws.Range(cell_ref).Select()
+        try:
+            excel_app.ActiveWindow.Activate()
+        except Exception:
+            pass
+    except Exception as e:
+        return False, f"Couldn't select {cell_ref} on {sheet_name}: {e}"
+
+    return True, f"Jumped to {sheet_name}!{cell_ref} in Excel."
+
+
+# ---------------------------------------------------------------------------
+# DEDICATED COM WORKER THREAD
+# ---------------------------------------------------------------------------
+# Excel's automation objects are STA (single-threaded apartment): once
+# created, they may only safely be driven from the thread that created
+# them, and that thread must have called pythoncom.CoInitialize() first.
+#
+# ThreadingHTTPServer spawns a brand-new thread for every single request,
+# which never calls CoInitialize() -- that's exactly what produced the
+# "CoInitialize has not been called" error. Fixing only that (calling
+# CoInitialize() inside do_POST) would still leave a subtler problem: the
+# cached workbook object in _opened_copies would end up being touched from
+# a DIFFERENT thread on every subsequent request, which STA COM objects
+# don't tolerate either.
+#
+# The fix: route every locate request through ONE dedicated background
+# thread that calls CoInitialize() exactly once and owns the COM apartment
+# (and therefore _opened_copies) for the lifetime of the process. HTTP
+# request threads never touch COM directly -- they just enqueue a request
+# and block on a small per-request queue for the result.
+
+_com_request_queue = queue.Queue()
+_com_worker_started = False
+_com_worker_lock = threading.Lock()
+
+
+def _com_worker_loop():
+    pythoncom.CoInitialize()
+    try:
+        while True:
+            file_path, workbook_name_hint, sheet, cell, response_q = _com_request_queue.get()
+            try:
+                result = locate_cell_in_excel_by_path(file_path, workbook_name_hint, sheet, cell)
+            except Exception as e:
+                result = (False, f"Unexpected error on the COM worker thread: {e}")
+            response_q.put(result)
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def _ensure_com_worker():
+    global _com_worker_started
+    with _com_worker_lock:
+        if not _com_worker_started:
+            threading.Thread(target=_com_worker_loop, daemon=True, name="excel-com-worker").start()
+            _com_worker_started = True
+
+
+def locate_via_com_worker(file_path: str, workbook_name_hint: str, sheet: str, cell: str, timeout: float = 30.0):
+    """
+    Public entry point for the HTTP handler. Hands the request to the
+    dedicated COM worker thread and blocks for its result, instead of
+    calling locate_cell_in_excel_by_path directly on the request's own
+    (COM-uninitialized) thread.
+    """
+    if not _WIN32COM_AVAILABLE:
+        return False, "Needs pywin32 (`pip install pywin32`) and only works on Windows with Excel installed."
+    _ensure_com_worker()
+    response_q = queue.Queue(maxsize=1)
+    _com_request_queue.put((file_path, workbook_name_hint, sheet, cell, response_q))
+    try:
+        return response_q.get(timeout=timeout)
+    except queue.Empty:
+        return False, "Timed out waiting for the COM worker thread to respond."
+
+
+# ---------------------------------------------------------------------------
+# HTTP server
+# ---------------------------------------------------------------------------
+
+CORS_HEADERS = {
+    # "null" is what a file:// page's Origin header actually is -- "*" also
+    # works for this purpose and is simpler to reason about, so use that.
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
+
+
+class LocateHandler(BaseHTTPRequestHandler):
+    # Quiet down the default request-logged-to-stderr-per-hit noise.
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send_json(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in CORS_HEADERS.items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        # Preflight request the browser sends before the real POST.
+        self.send_response(204)
+        for k, v in CORS_HEADERS.items():
+            self.send_header(k, v)
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path == "/ping":
+            self._send_json(200, {"ok": True, "com_available": _WIN32COM_AVAILABLE, "version": BRIDGE_VERSION})
+            return
+        self._send_json(404, {"ok": False, "message": "Not found. POST to /locate."})
+
+    def do_POST(self):
+        if self.path != "/locate":
+            self._send_json(404, {"ok": False, "message": "Not found. POST to /locate."})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b"{}"
+            data = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            self._send_json(400, {"ok": False, "message": f"Bad request body: {e}"})
+            return
+
+        file_path = data.get("file_path")
+        workbook_name_hint = data.get("workbook_name_hint", "")
+        sheet = data.get("sheet")
+        cell = data.get("cell")
+
+        if not file_path or not sheet or not cell:
+            self._send_json(400, {"ok": False, "message": "file_path, sheet, and cell are all required."})
+            return
+
+        ok, message = locate_via_com_worker(file_path, workbook_name_hint, sheet, cell)
+        self._send_json(200 if ok else 500, {"ok": ok, "message": message})
+
+
+def run_bridge(port: int = 8765):
+    if not _WIN32COM_AVAILABLE:
+        print("WARNING: pywin32 not available -- /locate will always fail. "
+              "Install with `pip install pywin32` on Windows.")
+    server = ThreadingHTTPServer(("127.0.0.1", port), LocateHandler)
+    print(f"Lineage locate-bridge listening on http://127.0.0.1:{port}  (Ctrl+C to stop)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Local COM bridge for the Filing Lineage diagram.")
+    parser.add_argument("--port", type=int, default=8765)
+    args = parser.parse_args()
+    run_bridge(args.port)
