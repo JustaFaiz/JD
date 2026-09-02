@@ -1,0 +1,1703 @@
+"""
+dashboard.py
+------------
+Filing-centric lineage engine + Streamlit UI + visual export.
+
+This is the counterpart to bridge.py. All the COM/Excel automation has
+been moved OUT of this file and into bridge.py, which runs as its own
+process and listens on localhost. This file:
+  - traces lineage (formula / named range / fuzzy fallback),
+  - classifies nodes and assembles the lineage dict,
+  - runs the Streamlit UI,
+  - builds the exported vis-network HTML diagram, whose side-panel
+    "Open in Excel" buttons fetch() against the bridge instead of calling
+    any Python function directly (there is no live Python behind a
+    file:// page -- see bridge.py's docstring for why).
+
+On "Open Visual in New Tab", this file:
+  1. writes the uploaded workbook to a stable temp path on disk (once
+     per uploaded file, not once per click -- reused across the session),
+  2. makes sure a bridge.py subprocess is running and reachable,
+  3. bakes that file path + the bridge's port into the exported HTML so
+     its JS knows where to send locate requests and for which file.
+
+Run with:
+    streamlit run dashboard.py
+"""
+
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import webbrowser
+
+import pandas as pd
+import numpy as np
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter, column_index_from_string
+from rapidfuzz import fuzz, process as rf_process
+
+try:
+    import streamlit as st
+except ImportError:
+    st = None  # allows importing this module's logic functions without Streamlit installed
+
+
+# ---------------------------------------------------------------------------
+# CONFIDENCE TIERS -- fixed by method, not blended
+# ---------------------------------------------------------------------------
+
+TIER_CONFIDENCE = {
+    "formula": 100,        # direct cross-sheet cell/range formula reference
+    "named_range": 90,     # formula uses a workbook-defined name resolving to another sheet
+    "description": 80,     # fuzzy sheet-name / row-label match
+    "value": 70,           # value-set overlap
+}
+CONFIDENCE_THRESHOLD = 70
+
+# Sheets named after a form line item (L10, L26, Line_15, "Line 20", etc.)
+# are calculation/support schedules, not raw data sources -- see original
+# rationale: often self-contained, which would otherwise wrongly classify
+# them as Input source. Adjustable per-workbook via the UI.
+LINE_SCHEDULE_PATTERN_DEFAULT = r"^(l|line)[\s_\-]?\d+|^(sch|schedule)\b"
+
+# Bumped whenever the shape of a lineage dict's relationships changes --
+# see classify_and_assemble / the schema-mismatch check in run_app.
+LINEAGE_SCHEMA_VERSION = 6  # bumped: relationships now also carry value_locations (full shared-value/cell list) for value-tier edges
+
+
+def matches_line_schedule_pattern(sheet_name, pattern):
+    if not pattern:
+        return False
+    try:
+        return bool(re.match(pattern, sheet_name.strip(), re.IGNORECASE))
+    except re.error:
+        return False
+
+
+DESCRIPTION_DETECT_THRESHOLD = 55   # rapidfuzz score (0-100) to count as "a description match exists"
+VALUE_DETECT_THRESHOLD = 0.25       # Jaccard overlap fraction to count as "a value match exists"
+
+MAX_COLS_FOR_MATCHING = 15
+MAX_ROWS_FOR_VALUE_MATCH = 300
+MAX_ROWS_FOR_LABEL_SCAN = 500
+MAX_POOL_ITEMS_FOR_FUZZ = 60  # cap on how many text items per sheet enter the cdist matrix
+MAX_VALUES_FOR_EXPORT_PER_EDGE = 500  # cap on shared values resolved-to-cells per value-tier edge, for the export
+
+
+# ---------------------------------------------------------------------------
+# FORMULA PARSING -- cross-sheet cell/range references
+# ---------------------------------------------------------------------------
+
+CELL_REF_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3}\$?\d{1,7})(?::(\$?[A-Z]{1,3}\$?\d{1,7}))?(?!\()"
+)
+COLUMN_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?([A-Z]{1,3})\$?:\$?([A-Z]{1,3})\$?(?![A-Za-z0-9_])"
+)
+ROW_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?(\d{1,7})\$?:\$?(\d{1,7})\$?(?![A-Za-z0-9_])"
+)
+NAME_TOKEN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_.]*)\b(?!\()")
+
+FULL_RANGE_ROW_CAP = 5000
+FULL_RANGE_COL_CAP = 200
+
+
+def extract_cross_sheet_refs(formula, current_sheet):
+    refs = set()
+    for m in CELL_REF_RE.finditer(formula):
+        sheet = m.group(1) or m.group(2)
+        if sheet and sheet != current_sheet:
+            refs.add(sheet)
+    for m in COLUMN_ONLY_RE.finditer(formula):
+        sheet = m.group(1) or m.group(2)
+        if sheet and sheet != current_sheet:
+            refs.add(sheet)
+    for m in ROW_ONLY_RE.finditer(formula):
+        sheet = m.group(1) or m.group(2)
+        if sheet and sheet != current_sheet:
+            refs.add(sheet)
+    return refs
+
+
+def extract_named_range_refs(formula, defined_name_map, current_sheet):
+    refs = set()
+    for m in NAME_TOKEN_RE.finditer(formula):
+        token = m.group(1).lower()
+        if token in defined_name_map:
+            for sheet in defined_name_map[token]:
+                if sheet != current_sheet:
+                    refs.add(sheet)
+    return refs
+
+
+def load_defined_name_map(wb):
+    name_map = {}
+
+    def add_destinations(name_obj, name_key):
+        try:
+            for sheet_name, _coord in name_obj.destinations:
+                name_map.setdefault(name_key, set()).add(sheet_name)
+        except Exception:
+            pass
+
+    try:
+        for name_key, name_obj in wb.defined_names.items():
+            add_destinations(name_obj, name_key.lower())
+    except AttributeError:
+        for name_obj in getattr(wb, "defined_names", []):
+            add_destinations(name_obj, getattr(name_obj, "name", "").lower())
+
+    for ws in wb.worksheets:
+        local_names = getattr(ws, "defined_names", None)
+        if not local_names:
+            continue
+        try:
+            for name_key, name_obj in local_names.items():
+                add_destinations(name_obj, name_key.lower())
+        except AttributeError:
+            pass
+
+    return name_map
+
+
+def load_workbook_formulas(file_bytes):
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=False, read_only=True)
+    defined_name_map = load_defined_name_map(wb)
+
+    formulas = {}
+    for ws in wb.worksheets:
+        for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            for c_idx, value in enumerate(row, start=1):
+                if isinstance(value, str) and value.startswith("="):
+                    coord = f"{get_column_letter(c_idx)}{r_idx}"
+                    formulas[(ws.title, coord)] = value
+    sheetnames = wb.sheetnames
+    wb.close()
+    return formulas, sheetnames, defined_name_map
+
+
+def _dedupe_headers(header):
+    seen = {}
+    deduped = []
+    for h in header:
+        if h in seen:
+            seen[h] += 1
+            deduped.append(f"{h}.{seen[h]}")
+        else:
+            seen[h] = 0
+            deduped.append(h)
+    return deduped
+
+
+def load_raw_sheets(file_bytes):
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    raw_sheets = {}
+    for ws in wb.worksheets:
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            raw_sheets[ws.title] = pd.DataFrame()
+            continue
+        header, *body = rows
+        header = [h if h is not None else f"Unnamed: {i}" for i, h in enumerate(header)]
+        header = _dedupe_headers(header)
+        df = pd.DataFrame(body, columns=header)
+        raw_sheets[ws.title] = df
+    wb.close()
+    return raw_sheets
+
+
+# ---------------------------------------------------------------------------
+# BACKWARD TRAVERSAL FROM THE ROOT
+# ---------------------------------------------------------------------------
+
+def trace_lineage_from_root(root_sheet, formulas, defined_name_map):
+    edges = {}
+    counts = {}
+    visited = {root_sheet}
+    frontier = [root_sheet]
+
+    formulas_by_sheet = {}
+    for (sheet, coord), f in formulas.items():
+        formulas_by_sheet.setdefault(sheet, []).append(f)
+
+    while frontier:
+        next_frontier = []
+        for current in frontier:
+            for f in formulas_by_sheet.get(current, []):
+                direct_refs = extract_cross_sheet_refs(f, current)
+                named_refs = extract_named_range_refs(f, defined_name_map, current) - direct_refs
+                all_refs = direct_refs | named_refs
+
+                for src in all_refs:
+                    counts[(src, current)] = counts.get((src, current), 0) + 1
+
+                for src in direct_refs:
+                    key = (src, current)
+                    if key not in edges or edges[key]["tier"] != "formula":
+                        edges[key] = {"tier": "formula", "confidence": TIER_CONFIDENCE["formula"]}
+                    if src not in visited:
+                        visited.add(src)
+                        next_frontier.append(src)
+
+                for src in named_refs:
+                    key = (src, current)
+                    if key not in edges:
+                        edges[key] = {"tier": "named_range", "confidence": TIER_CONFIDENCE["named_range"]}
+                    if src not in visited:
+                        visited.add(src)
+                        next_frontier.append(src)
+        frontier = next_frontier
+
+    for key, info in edges.items():
+        info["count"] = counts.get(key, 0)
+
+    return edges, visited
+
+
+# ---------------------------------------------------------------------------
+# FALLBACK: description similarity + value overlap for unreached sheets
+# ---------------------------------------------------------------------------
+
+def build_text_pool(df, sheet_name, max_rows=MAX_ROWS_FOR_LABEL_SCAN):
+    texts = [sheet_name]
+    cell_refs = [None]
+    for col_pos, col in enumerate(df.columns[:MAX_COLS_FOR_MATCHING]):
+        col_letter = get_column_letter(col_pos + 1)
+        series = df[col].dropna().astype(str).head(max_rows)
+        for row_pos, v in series.items():
+            if v.replace(".", "", 1).replace("-", "", 1).isdigit():
+                continue
+            texts.append(v)
+            cell_refs.append(f"{col_letter}{row_pos + 2}")
+    if len(texts) > MAX_POOL_ITEMS_FOR_FUZZ:
+        return texts[:MAX_POOL_ITEMS_FOR_FUZZ], cell_refs[:MAX_POOL_ITEMS_FOR_FUZZ]
+    return texts, cell_refs
+
+
+def description_similarity(pool_a, pool_b, locations_a=None, locations_b=None, top_k=5):
+    empty = {"score": 0.0, "text_a": None, "text_b": None, "corroborating_matches": 0, "top_matches": []}
+    if not pool_a or not pool_b:
+        return empty
+    matrix = rf_process.cdist(pool_a, pool_b, scorer=fuzz.token_sort_ratio)
+    if matrix.size == 0:
+        return empty
+
+    row_best_idx = matrix.argmax(axis=1)
+    row_best_score = matrix.max(axis=1)
+    order = np.argsort(-row_best_score)
+
+    best_i = int(order[0])
+    best_j = int(row_best_idx[best_i])
+    best_score = float(row_best_score[best_i])
+    corroborating = int((row_best_score >= DESCRIPTION_DETECT_THRESHOLD).sum())
+
+    top_matches = []
+    for i in order:
+        i = int(i)
+        score = float(row_best_score[i])
+        if score < DESCRIPTION_DETECT_THRESHOLD:
+            break
+        j = int(row_best_idx[i])
+        entry = {"text_a": pool_a[i], "text_b": pool_b[j], "score": round(score, 1)}
+        if locations_a is not None:
+            entry["cell_a"] = locations_a[i]
+        if locations_b is not None:
+            entry["cell_b"] = locations_b[j]
+        top_matches.append(entry)
+        if len(top_matches) >= top_k:
+            break
+
+    return {
+        "score": best_score, "text_a": pool_a[best_i], "text_b": pool_b[best_j],
+        "corroborating_matches": corroborating, "top_matches": top_matches,
+    }
+
+
+def value_overlap_score(series_a: pd.Series, series_b: pd.Series) -> float:
+    set_a = set(series_a.dropna().astype(str).str.strip().str.upper())
+    set_b = set(series_b.dropna().astype(str).str.strip().str.upper())
+    if not set_a or not set_b:
+        return 0.0
+    smaller = min(len(set_a), len(set_b))
+    return (len(set_a & set_b) / smaller) if smaller else 0.0
+
+
+def value_similarity(df_a, df_b):
+    cols_a = list(df_a.columns)[:MAX_COLS_FOR_MATCHING]
+    cols_b = list(df_b.columns)[:MAX_COLS_FOR_MATCHING]
+    empty = {
+        "score": 0.0, "column_a": None, "column_b": None, "overlap_count": 0,
+        "smaller_set_size": 0, "sample_shared_values": [], "corroborating_columns": 0,
+    }
+    if not cols_a or not cols_b:
+        return empty
+
+    sample_a = df_a[cols_a].head(MAX_ROWS_FOR_VALUE_MATCH)
+    sample_b = df_b[cols_b].head(MAX_ROWS_FOR_VALUE_MATCH)
+    sets_b = {}
+    for cb in cols_b:
+        try:
+            sets_b[cb] = set(sample_b[cb].dropna().astype(str).str.strip().str.upper())
+        except Exception:
+            sets_b[cb] = set()
+
+    per_col_best = []
+    for ca in cols_a:
+        try:
+            set_a = set(sample_a[ca].dropna().astype(str).str.strip().str.upper())
+        except Exception:
+            set_a = set()
+        best_score, best_cb, best_overlap, best_smaller, best_shared = 0.0, None, 0, 0, set()
+        if set_a:
+            for cb in cols_b:
+                set_b = sets_b[cb]
+                if not set_b:
+                    continue
+                smaller = min(len(set_a), len(set_b))
+                shared = set_a & set_b
+                score = (len(shared) / smaller) if smaller else 0.0
+                if score > best_score:
+                    best_score, best_cb, best_overlap, best_smaller, best_shared = score, cb, len(shared), smaller, shared
+        per_col_best.append((ca, best_score, best_cb, best_overlap, best_smaller, best_shared))
+
+    avg_score = sum(e[1] for e in per_col_best) / len(per_col_best) if per_col_best else 0.0
+    corroborating_columns = sum(1 for e in per_col_best if e[1] >= VALUE_DETECT_THRESHOLD)
+    top = max(per_col_best, key=lambda e: e[1]) if per_col_best else None
+
+    if top and top[1] > 0:
+        column_a, _, column_b, overlap_count, smaller_set_size, shared_values = top
+        sample_shared_values = sorted(shared_values)[:5]
+        # Full overlap set (not the 5-item UI sample) -- this is what the
+        # value-overlap lineage export resolves cell locations for, since
+        # "give me every copy-pasted value" needs more than 5 examples.
+        # Capped so one enormous matching column pair can't blow up the
+        # export; MAX_VALUES_FOR_EXPORT_PER_EDGE below controls this.
+        full_shared_values = sorted(shared_values)[:MAX_VALUES_FOR_EXPORT_PER_EDGE]
+    else:
+        column_a = column_b = None
+        overlap_count = smaller_set_size = 0
+        sample_shared_values = []
+        full_shared_values = []
+
+    # Resolve a concrete cell for EVERY sample shared value (not just the
+    # first one) -- this is what powers both the single "jump to this cell"
+    # anchor button (cell_a/cell_b, kept for backward compat) AND the full
+    # value-overlap lineage export, where each individual copy-pasted
+    # number needs its own source/target cell pair, not just one example.
+    cell_a = cell_b = None
+    value_locations = []
+    if full_shared_values:
+        try:
+            col_pos_a = cols_a.index(column_a)
+            match_a = sample_a[column_a].dropna().astype(str).str.strip().str.upper()
+        except Exception:
+            col_pos_a, match_a = None, None
+        try:
+            col_pos_b = cols_b.index(column_b)
+            match_b = sample_b[column_b].dropna().astype(str).str.strip().str.upper()
+        except Exception:
+            col_pos_b, match_b = None, None
+
+        for v in full_shared_values:
+            va = vb = None
+            if match_a is not None:
+                row_idx_a = match_a[match_a == v].index
+                if len(row_idx_a) > 0:
+                    va = f"{get_column_letter(col_pos_a + 1)}{row_idx_a[0] + 2}"
+            if match_b is not None:
+                row_idx_b = match_b[match_b == v].index
+                if len(row_idx_b) > 0:
+                    vb = f"{get_column_letter(col_pos_b + 1)}{row_idx_b[0] + 2}"
+            value_locations.append({"value": v, "cell_a": va, "cell_b": vb})
+
+        if value_locations:
+            cell_a, cell_b = value_locations[0]["cell_a"], value_locations[0]["cell_b"]
+
+    return {
+        "score": avg_score, "column_a": column_a, "column_b": column_b,
+        "overlap_count": overlap_count, "smaller_set_size": smaller_set_size,
+        "sample_shared_values": sample_shared_values, "corroborating_columns": corroborating_columns,
+        "cell_a": cell_a, "cell_b": cell_b, "value_locations": value_locations,
+    }
+
+
+def fallback_match_unreached_sheets(unmapped_sheets, lineage_sheets, raw_sheets):
+    results = {}
+    text_pools = {}
+    text_pool_cells = {}
+    for s in lineage_sheets:
+        if s in raw_sheets:
+            texts, cells = build_text_pool(raw_sheets[s], s)
+            text_pools[s] = texts
+            text_pool_cells[s] = cells
+
+    for sheet in unmapped_sheets:
+        if sheet not in raw_sheets:
+            continue
+        df = raw_sheets[sheet]
+        pool, pool_cells = build_text_pool(df, sheet)
+
+        best_desc, best_desc_parent = None, None
+        for parent in lineage_sheets:
+            if parent not in text_pools:
+                continue
+            detail = description_similarity(pool, text_pools[parent], pool_cells, text_pool_cells[parent])
+            if best_desc is None or detail["score"] > best_desc["score"]:
+                best_desc, best_desc_parent = detail, parent
+
+        if best_desc and best_desc["score"] >= DESCRIPTION_DETECT_THRESHOLD:
+            corroborating = best_desc["corroborating_matches"]
+            top_matches = best_desc["top_matches"]
+            corroboration_note = (
+                f"; {corroborating} other label(s) also matched" if corroborating > 1
+                else "; only this one label matched -- treat with caution"
+            )
+            pairs_text = "; ".join(
+                f"'{m['text_a']}' (cell {m.get('cell_a') or '?'} on {sheet}) ~ "
+                f"'{m['text_b']}' (cell {m.get('cell_b') or '?'} on {best_desc_parent})"
+                for m in top_matches[:3]
+            )
+            results[sheet] = {
+                "parent": best_desc_parent, "tier": "description",
+                "confidence": TIER_CONFIDENCE["description"],
+                "match_score": round(best_desc["score"], 1),
+                "corroborating_matches": corroborating,
+                "top_matches": top_matches,
+                "evidence_detail": f"{pairs_text}{corroboration_note}",
+            }
+            continue
+
+        best_val, best_val_parent = None, None
+        for parent in lineage_sheets:
+            if parent not in raw_sheets:
+                continue
+            detail = value_similarity(df, raw_sheets[parent])
+            if best_val is None or detail["score"] > best_val["score"]:
+                best_val, best_val_parent = detail, parent
+
+        if best_val and best_val["score"] >= VALUE_DETECT_THRESHOLD:
+            sample_str = ", ".join(best_val["sample_shared_values"][:3]) if best_val["sample_shared_values"] else "n/a"
+            corroborating_cols = best_val["corroborating_columns"]
+            corroboration_note = (
+                f"; {corroborating_cols} column pair(s) corroborate" if corroborating_cols > 1
+                else "; only one column pair matched -- treat with caution"
+            )
+            cell_a, cell_b = best_val.get("cell_a"), best_val.get("cell_b")
+            cell_text = f" -- e.g. {sheet}!{cell_a} = {best_val_parent}!{cell_b}" if cell_a and cell_b else ""
+            results[sheet] = {
+                "parent": best_val_parent, "tier": "value",
+                "confidence": TIER_CONFIDENCE["value"],
+                "match_score": round(best_val["score"] * 100, 1),
+                "overlap_count": best_val["overlap_count"],
+                "overlap_total": best_val["smaller_set_size"],
+                "corroborating_columns": corroborating_cols,
+                "cell_a": cell_a, "cell_b": cell_b,
+                "value_locations": best_val.get("value_locations", []),
+                "evidence_detail": (
+                    f"{best_val['overlap_count']} of {best_val['smaller_set_size']} shared values in "
+                    f"{best_val['column_a']} vs {best_val['column_b']} (e.g. {sample_str}){cell_text}{corroboration_note}"
+                ),
+            }
+
+    return {k: v for k, v in results.items() if v["confidence"] >= CONFIDENCE_THRESHOLD}
+
+
+# ---------------------------------------------------------------------------
+# LINE 30 / TAXABLE INCOME AUTO-DETECTION
+# ---------------------------------------------------------------------------
+
+LINE30_LABEL_HINTS = ["taxable income", "line 30", "net taxable income"]
+CELL_ADDR_RE = re.compile(r"^\$?([A-Za-z]{1,3})\$?(\d{1,7})$")
+
+
+def lookup_cell_direct(values_ws, formulas_ws, cell_ref):
+    m = CELL_ADDR_RE.match(cell_ref.strip())
+    if not m:
+        return None
+    col_letters, row_str = m.group(1).upper(), m.group(2)
+    row_idx = int(row_str)
+    try:
+        col_idx = column_index_from_string(col_letters)
+    except ValueError:
+        return None
+
+    value = values_ws.cell(row=row_idx, column=col_idx).value
+    label = values_ws.cell(row=row_idx, column=1).value
+
+    raw = formulas_ws.cell(row=row_idx, column=col_idx).value
+    formula = raw if isinstance(raw, str) and raw.startswith("=") else None
+
+    return {"row": row_idx, "col": col_letters, "label": label, "value": value, "formula": formula}
+
+
+def detect_final_output_cell(df, target_row_hint=30):
+    candidates = []
+    for col in df.columns[:5]:
+        series = df[col].dropna().astype(str)
+        for row_idx, text in series.items():
+            best_hint_score = max(fuzz.partial_ratio(text.lower(), hint) for hint in LINE30_LABEL_HINTS)
+            if best_hint_score < 60:
+                continue
+            row_distance_penalty = min(abs((row_idx + 2) - target_row_hint), 20)
+            adjusted_score = best_hint_score - row_distance_penalty
+            candidates.append((row_idx, col, text, round(adjusted_score, 1)))
+    candidates.sort(key=lambda c: c[3], reverse=True)
+    return candidates[:10]
+
+
+# ---------------------------------------------------------------------------
+# CLASSIFICATION + ASSEMBLY
+# ---------------------------------------------------------------------------
+
+def classify_and_assemble(root_sheet, traced_edges, fallback_edges, final_output_desc,
+                           line_schedule_pattern=LINE_SCHEDULE_PATTERN_DEFAULT):
+    fed_by_traced = {}
+    best_parent_traced = {}
+
+    for (src, dst), info in traced_edges.items():
+        fed_by_traced.setdefault(dst, set()).add(src)
+        if src not in best_parent_traced or info["confidence"] > best_parent_traced[src][2]:
+            best_parent_traced[src] = (dst, info["tier"], info["confidence"])
+
+    traced_sheets = {root_sheet} | {s for pair in traced_edges for s in pair}
+
+    nodes = []
+    for sheet in sorted(traced_sheets):
+        if sheet == root_sheet:
+            nodes.append({
+                "sheet_name": sheet, "classification": "Output node",
+                "parent_sheet": None, "filing_reference": root_sheet,
+                "confidence_score": 100, "match_method": None,
+            })
+            continue
+        is_line_schedule = matches_line_schedule_pattern(sheet, line_schedule_pattern)
+        classification = "Process node" if (sheet in fed_by_traced or is_line_schedule) else "Input source"
+        parent_sheet, tier, confidence = best_parent_traced.get(sheet, (None, None, 0))
+        nodes.append({
+            "sheet_name": sheet, "classification": classification,
+            "parent_sheet": parent_sheet, "filing_reference": root_sheet,
+            "confidence_score": confidence, "match_method": tier,
+        })
+
+    for sheet, info in fallback_edges.items():
+        is_line_schedule = matches_line_schedule_pattern(sheet, line_schedule_pattern)
+        nodes.append({
+            "sheet_name": sheet, "classification": "Process node" if is_line_schedule else "Input source",
+            "parent_sheet": info["parent"], "filing_reference": root_sheet,
+            "confidence_score": info["confidence"], "match_method": info["tier"],
+        })
+
+    relationships = [
+        {
+            "source": src, "target": dst, "relationship": "feeds",
+            "formula_count": info.get("count", 0), "method": info["tier"],
+        }
+        for (src, dst), info in traced_edges.items()
+    ] + [
+        {
+            "source": sheet, "target": info["parent"], "relationship": "feeds",
+            "formula_count": None, "method": info["tier"],
+            "match_score": info.get("match_score"),
+            "corroborating_matches": info.get("corroborating_matches"),
+            "corroborating_columns": info.get("corroborating_columns"),
+            "overlap_count": info.get("overlap_count"),
+            "overlap_total": info.get("overlap_total"),
+            "evidence_detail": info.get("evidence_detail"),
+            # NEW (schema v5): carried through so the exported diagram's
+            # side panel can render per-match "open in Excel" buttons
+            # without needing separate access to lineage["fallback_evidence"].
+            # cell_a/cell_b: the single resolved shared-value cell pair for
+            #   a "value" tier match. top_matches: the full ranked list of
+            #   text-pair matches (each with its own cell_a/cell_b) for a
+            #   "description" tier match -- absent/None for formula/named_range.
+            "cell_a": info.get("cell_a"),
+            "cell_b": info.get("cell_b"),
+            "top_matches": info.get("top_matches"),
+            # NEW (schema v6): full resolved shared-value/cell list for a
+            # "value" tier match -- powers the value-overlap lineage
+            # export (every copy-pasted number, not just one example).
+            "value_locations": info.get("value_locations"),
+        }
+        for sheet, info in fallback_edges.items()
+    ]
+
+    return {
+        "filing_reference": root_sheet,
+        "final_output": final_output_desc,
+        "nodes": nodes,
+        "relationships": relationships,
+        "fallback_evidence": fallback_edges,
+        "schema_version": LINEAGE_SCHEMA_VERSION,
+    }
+
+
+def get_downstream_lineage(lineage: dict, start_sheet: str):
+    return get_downstream_lineage_multi(lineage, [start_sheet])
+
+
+def get_downstream_lineage_multi(lineage: dict, start_sheets: list):
+    node_map = {n["sheet_name"]: n for n in lineage["nodes"]}
+    valid_starts = [s for s in start_sheets if s in node_map]
+    if not valid_starts:
+        return None
+
+    forward = {}
+    rel_lookup = {}
+    for r in lineage["relationships"]:
+        forward.setdefault(r["source"], []).append(r["target"])
+        rel_lookup[(r["source"], r["target"])] = r
+
+    visited_nodes = set(valid_starts)
+    visited_edges = set()
+    frontier = list(valid_starts)
+    while frontier:
+        next_frontier = []
+        for current in frontier:
+            for dst in forward.get(current, []):
+                edge = (current, dst)
+                if edge not in visited_edges:
+                    visited_edges.add(edge)
+                if dst not in visited_nodes:
+                    visited_nodes.add(dst)
+                    next_frontier.append(dst)
+        frontier = next_frontier
+
+    return {
+        "filing_reference": lineage["filing_reference"],
+        "final_output": lineage["final_output"],
+        "nodes": [node_map[s] for s in visited_nodes if s in node_map],
+        "relationships": [rel_lookup[e] for e in sorted(visited_edges) if e in rel_lookup],
+        "combined_from": valid_starts,
+        "schema_version": LINEAGE_SCHEMA_VERSION,
+    }
+
+
+EDGE_FILTER_OPTIONS = {
+    "All connections (formula + named range + fuzzy matches)": {"formula", "named_range", "description", "value"},
+    "Formula + named range only (exclude fuzzy matches)": {"formula", "named_range"},
+    "Direct cell formulas only (exclude named ranges & fuzzy matches)": {"formula"},
+}
+
+
+def filter_lineage_by_methods(lineage: dict, allowed_methods: set) -> dict:
+    root = lineage["filing_reference"]
+    filtered_rels = [r for r in lineage["relationships"] if r.get("method") in allowed_methods]
+    node_map = {n["sheet_name"]: n for n in lineage["nodes"]}
+    combined_from = lineage.get("combined_from")
+
+    if combined_from:
+        forward = {}
+        for r in filtered_rels:
+            forward.setdefault(r["source"], []).append(r["target"])
+        visited = {s for s in combined_from if s in node_map}
+        frontier = list(visited)
+        while frontier:
+            next_frontier = []
+            for current in frontier:
+                for dst in forward.get(current, []):
+                    if dst not in visited:
+                        visited.add(dst)
+                        next_frontier.append(dst)
+            frontier = next_frontier
+    else:
+        backward = {}
+        for r in filtered_rels:
+            backward.setdefault(r["target"], []).append(r["source"])
+        visited = {root}
+        frontier = [root]
+        while frontier:
+            next_frontier = []
+            for current in frontier:
+                for src in backward.get(current, []):
+                    if src not in visited:
+                        visited.add(src)
+                        next_frontier.append(src)
+            frontier = next_frontier
+
+    kept_rels = [r for r in filtered_rels if r["source"] in visited and r["target"] in visited]
+
+    return {
+        "filing_reference": lineage["filing_reference"],
+        "final_output": lineage["final_output"],
+        "nodes": [node_map[s] for s in visited if s in node_map],
+        "relationships": kept_rels,
+        "combined_from": lineage.get("combined_from"),
+        "schema_version": lineage.get("schema_version", LINEAGE_SCHEMA_VERSION),
+    }
+
+
+# ---------------------------------------------------------------------------
+# EXPORT HELPERS
+# ---------------------------------------------------------------------------
+
+def lineage_to_excel_bytes(lineage: dict) -> bytes:
+    nodes_df = pd.DataFrame(lineage["nodes"])
+    rel_df = pd.DataFrame(lineage["relationships"])
+    summary_df = pd.DataFrame([{
+        "Filing Reference": lineage["filing_reference"],
+        "Final Output": lineage["final_output"],
+        "Combined From": ", ".join(lineage["combined_from"]) if lineage.get("combined_from") else "",
+        "Node Count": len(lineage["nodes"]),
+        "Relationship Count": len(lineage["relationships"]),
+    }])
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, index=False, sheet_name="Summary")
+        nodes_df.to_excel(writer, index=False, sheet_name="Nodes")
+        rel_df.to_excel(writer, index=False, sheet_name="Relationships")
+    return buf.getvalue()
+
+
+def value_overlap_lineage_to_excel_bytes(lineage: dict) -> bytes:
+    """
+    Downloadable Excel of every value-overlap ("value" tier) connection in
+    this lineage -- one row per matched shared value, with both sides'
+    sheet name, cell reference, and the actual value that appears in both
+    places. In a tax workpaper this is typically the "copy-pasted number"
+    lineage: a value with no formula link and no label match between the
+    two sheets, but the same number sitting in both -- i.e. it was
+    manually re-entered or pasted rather than formula-fed.
+
+    One row per (relationship, shared value) pair -- NOT one row per
+    relationship -- since a single sheet-to-sheet value-tier connection
+    can rest on several independently-copied numbers, each with its own
+    source/target cell. A connection with no resolved cell-level detail
+    (value found in both sheets but its exact row couldn't be pinned down)
+    still gets one row so it isn't silently dropped, with blank cell
+    columns and the value column blank too.
+    """
+    rows = []
+    for r in lineage["relationships"]:
+        if r.get("method") != "value":
+            continue
+        source, target = r["source"], r["target"]
+        locations = r.get("value_locations") or []
+        if not locations:
+            rows.append({
+                "Source Sheet": source, "Source Cell": None,
+                "Target Sheet": target, "Target Cell": None,
+                "Shared Value": None,
+                "Match Score (%)": r.get("match_score"),
+                "Overlap Count": r.get("overlap_count"),
+                "Overlap Total": r.get("overlap_total"),
+            })
+            continue
+        for loc in locations:
+            rows.append({
+                "Source Sheet": source, "Source Cell": loc.get("cell_a"),
+                "Target Sheet": target, "Target Cell": loc.get("cell_b"),
+                "Shared Value": loc.get("value"),
+                "Match Score (%)": r.get("match_score"),
+                "Overlap Count": r.get("overlap_count"),
+                "Overlap Total": r.get("overlap_total"),
+            })
+
+    df = pd.DataFrame(rows, columns=[
+        "Source Sheet", "Source Cell", "Target Sheet", "Target Cell",
+        "Shared Value", "Match Score (%)", "Overlap Count", "Overlap Total",
+    ])
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Value Overlap Lineage")
+    return buf.getvalue()
+
+
+NODE_COLOR = {"Input source": "#2ecc71", "Process node": "#2a9d8f", "Output node": "#f1c40f"}
+COMBINED_START_COLOR = "#e76f51"
+
+
+def compute_lineage_depths(lineage: dict) -> dict:
+    root = lineage["filing_reference"]
+    feeds_into = {}
+    for n in lineage["nodes"]:
+        if n["parent_sheet"]:
+            feeds_into[n["sheet_name"]] = n["parent_sheet"]
+
+    depths = {root: 0}
+    for n in lineage["nodes"]:
+        sheet = n["sheet_name"]
+        if sheet in depths:
+            continue
+        chain = []
+        cursor = sheet
+        seen = set()
+        while cursor not in depths and cursor in feeds_into and cursor not in seen:
+            seen.add(cursor)
+            chain.append(cursor)
+            cursor = feeds_into[cursor]
+        base_depth = depths.get(cursor, 0)
+        for j, s in enumerate(chain):
+            depths[s] = base_depth + (len(chain) - j)
+    return depths
+
+
+def _edge_label_and_title(r: dict) -> tuple:
+    method = r.get("method")
+    count = r.get("formula_count")
+    src, dst = r["source"], r["target"]
+
+    if method in ("formula", "named_range") and count:
+        label = str(count)
+        noun = "formula" if count == 1 else "formulas"
+        via = " (via a named range)" if method == "named_range" else ""
+        title = f"{count} {noun} on {dst} reference {src}{via}"
+    elif method == "description":
+        score = r.get("match_score")
+        label = f"~desc {score:.0f}%" if score is not None else "~desc"
+        detail = r.get("evidence_detail") or ""
+        title = f"{src} matched to {dst} by description similarity -- no direct formula link found. {detail}"
+    elif method == "value":
+        score = r.get("match_score")
+        label = f"~val {score:.0f}%" if score is not None else "~val"
+        detail = r.get("evidence_detail") or ""
+        title = f"{src} matched to {dst} by shared data values -- no direct formula link found. {detail}"
+    else:
+        label = ""
+        title = f"{src} feeds {dst}"
+    return label, title
+
+
+def build_lineage_visual_html(lineage: dict, filter_label: str = None,
+                               bridge_port: int = None, file_path: str = None,
+                               workbook_name_hint: str = None) -> str:
+    """
+    Same as before, PLUS: if bridge_port and file_path are supplied, every
+    fuzzy-matched (description/value) edge in the side panel gets real
+    "Open in Excel" buttons that fetch() the locate bridge -- one button
+    per matched cell pair. Both description-tier edges (which can carry
+    several corroborating text-pair matches) and value-tier edges (which
+    carry one resolved shared-value cell pair) are covered; description
+    edges get a button per top_matches entry instead of only the merged
+    evidence sentence, so each individual corroborating match is
+    independently inspectable and clickable, not just described in prose.
+
+    If bridge_port/file_path are omitted, the panel still shows the
+    evidence text as before -- it just renders without buttons (e.g. for
+    a plain "download the HTML and look at it later, no bridge running"
+    use case).
+    """
+    depths = compute_lineage_depths(lineage)
+    max_depth = max(depths.values()) if depths else 0
+    combined_from = set(lineage.get("combined_from") or [])
+
+    nodes_json = json.dumps([
+        {
+            "id": n["sheet_name"], "label": n["sheet_name"],
+            "color": COMBINED_START_COLOR if n["sheet_name"] in combined_from else NODE_COLOR.get(n["classification"], "#888888"),
+            "shape": "box", "size": 30 if n["classification"] == "Output node" else 24,
+            "level": depths.get(n["sheet_name"], max_depth),
+            "title": (
+                f"{n['sheet_name']}\\nClassification: {n['classification']}"
+                f"\\nConfidence: {n['confidence_score']}%"
+                f"\\nMethod: {n['match_method'] or '(root)'}"
+            ),
+            "font": {"color": "#ffffff", "size": 16},
+        }
+        for n in lineage["nodes"]
+    ])
+
+    edge_dicts = []
+    for r in lineage["relationships"]:
+        label, title = _edge_label_and_title(r)
+        method = r.get("method")
+        entry = {
+            "from": r["source"], "to": r["target"], "arrows": "to",
+            "label": label, "title": title,
+            "method": method,
+            "evidenceDetail": r.get("evidence_detail"),
+        }
+        if method == "value":
+            entry["cellA"] = r.get("cell_a")
+            entry["cellB"] = r.get("cell_b")
+        elif method == "description":
+            # top_matches entries already carry text_a/text_b/score/cell_a/cell_b
+            entry["topMatches"] = r.get("top_matches") or []
+        edge_dicts.append(entry)
+    edges_json = json.dumps(edge_dicts)
+
+    bridge_config_json = json.dumps({
+        "enabled": bool(bridge_port and file_path),
+        "url": f"http://127.0.0.1:{bridge_port}/locate" if bridge_port else None,
+        "filePath": file_path,
+        "workbookNameHint": workbook_name_hint or "",
+    })
+
+    legend_extra = (
+        "Orange = sheet(s) you selected for this combined view.<br>"
+        if combined_from else ""
+    )
+    if filter_label:
+        legend_extra += f"<b>Filter:</b> {filter_label} -- sheets/edges outside this filter are hidden here (still present in the tables/exports).<br>"
+    if bridge_port and file_path:
+        legend_extra += (
+            "Click a fuzzy-matched edge's \"Open in Excel\" buttons in the side panel to jump straight "
+            "to the matched cell -- requires the locate-bridge (bridge.py) to still be running.<br>"
+        )
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8">
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  html, body {{ margin:0; padding:0; background:#111111; }}
+  #tree {{ width:100vw; height:100vh; }}
+  #hint {{
+    position:fixed; top:10px; left:10px; color:white; font-family:sans-serif;
+    font-size:14px; background:rgba(0,0,0,0.6); padding:10px 16px; border-radius:6px; max-width:460px;
+    z-index: 5;
+  }}
+  #side-panel {{
+    position:fixed; top:0; right:0; width:340px; height:100vh; box-sizing:border-box;
+    background:#1b1b1b; color:#eee; font-family:sans-serif;
+    transform:translateX(100%); transition:transform 0.18s ease;
+    padding:20px; overflow-y:auto; box-shadow:-4px 0 14px rgba(0,0,0,0.6); z-index:20;
+  }}
+  #side-panel.open {{ transform:translateX(0); }}
+  #side-panel .close-btn {{ position:absolute; top:10px; right:14px; cursor:pointer; font-size:20px; color:#aaa; }}
+  #side-panel .close-btn:hover {{ color:#fff; }}
+  #side-panel h3 {{ margin:0 30px 4px 0; word-break:break-word; }}
+  #side-panel .section-title {{
+    margin-top:18px; font-weight:bold; color:#f1c40f; font-size:13px;
+    text-transform:uppercase; letter-spacing:0.03em; border-bottom:1px solid #333; padding-bottom:4px;
+  }}
+  #side-panel ul {{ list-style:none; padding-left:0; margin:8px 0 0 0; }}
+  #side-panel li {{ padding:8px 0; border-bottom:1px solid #2a2a2a; font-size:13px; }}
+  #side-panel li .tag {{ color:#888; font-size:11px; margin-left:6px; }}
+  #side-panel li .evidence-detail {{
+    display:block; color:#aaa; font-size:11px; font-style:italic;
+    margin-top:3px; line-height:1.4; word-break:break-word;
+  }}
+  #side-panel .match-row {{
+    margin-top:8px; padding:8px; background:#242424; border-radius:5px;
+  }}
+  #side-panel .match-row .match-text {{
+    font-size:12px; color:#ddd; line-height:1.4; word-break:break-word;
+  }}
+  #side-panel .match-row .match-score {{ color:#f1c40f; font-size:11px; margin-left:4px; }}
+  #side-panel .locate-buttons {{ margin-top:6px; display:flex; gap:6px; flex-wrap:wrap; }}
+  #side-panel .locate-btn {{
+    background:#2a9d8f; color:#fff; border:none; border-radius:4px; padding:4px 8px;
+    font-size:11px; cursor:pointer;
+  }}
+  #side-panel .locate-btn:hover {{ background:#238b7e; }}
+  #side-panel .locate-btn:disabled {{ background:#444; cursor:not-allowed; }}
+  #side-panel .locate-status {{ font-size:11px; margin-top:4px; display:block; }}
+  #side-panel .locate-status.ok {{ color:#6fcf97; }}
+  #side-panel .locate-status.err {{ color:#eb5757; }}
+  #side-panel .empty {{ color:#777; font-size:13px; font-style:italic; }}
+  #side-panel .bridge-warning {{
+    color:#f2c94c; font-size:11px; margin-top:10px; padding:8px; background:#2a2410; border-radius:5px;
+  }}
+</style></head>
+<body>
+<div id="hint">
+  <b>Filing reference:</b> {lineage['filing_reference']}<br>
+  <b>Final output:</b> {lineage['final_output']}<br>
+  Green = Input source, teal = Process node, gold = Output node (root).<br>
+  {legend_extra}
+  Edge numbers = formula count linking those sheets. "~desc"/"~val" = fuzzy-matched (no direct formula) with match strength % -- hover for the actual matched text/values and how many corroborate it.<br>
+  Click a sheet: its direct connections light up, everything else dims, and a panel opens with the full fed-by/fed-to detail. Click empty space to reset.<br>
+  Top = furthest upstream, bottom = filing output.
+</div>
+<div id="tree"></div>
+<div id="side-panel">
+  <span class="close-btn" onclick="closePanel()">&times;</span>
+  <h3 id="panel-title"></h3>
+  <div class="section-title">Fed by (upstream sources)</div>
+  <ul id="fed-by-list"></ul>
+  <div class="section-title">Fed to (downstream)</div>
+  <ul id="fed-to-list"></ul>
+</div>
+<script>
+  var BRIDGE = {bridge_config_json};
+
+  var nodes = new vis.DataSet({nodes_json});
+  var edges = new vis.DataSet({edges_json});
+  var network = new vis.Network(document.getElementById('tree'), {{nodes: nodes, edges: edges}}, {{
+    layout: {{
+      hierarchical: {{
+        enabled: true, direction: "DU", sortMethod: "directed",
+        levelSeparation: 220, nodeSpacing: 260, treeSpacing: 280
+      }}
+    }},
+    physics: {{
+      hierarchicalRepulsion: {{ nodeDistance: 260 }},
+      solver: "hierarchicalRepulsion"
+    }},
+    interaction: {{ dragNodes: true, dragView: true, zoomView: true }},
+    edges: {{
+      smooth: {{ type: "cubicBezier", forceDirection: "vertical" }},
+      arrows: {{ to: {{ enabled: true }} }}, color: "#888888",
+      font: {{ color: "#ffffff", strokeWidth: 3, strokeColor: "#111111", size: 13 }}
+    }},
+    nodes: {{ font: {{ color: "#ffffff", size: 16 }} }}
+  }});
+  network.once("stabilizationIterationsDone", function () {{ network.setOptions({{physics: false}}); }});
+
+  var HIGHLIGHT_COLOR = "#4dd0e1";
+  var DIM_NODE_OPACITY = 0.12;
+  var DIM_EDGE_OPACITY = 0.08;
+  var DIM_FONT_COLOR = "rgba(255,255,255,0.25)";
+  var FULL_FONT_COLOR = "#ffffff";
+
+  var originalNodeColors = {{}};
+  nodes.get().forEach(function (n) {{ originalNodeColors[n.id] = n.color; }});
+
+  function pinPositions(positions) {{
+    Object.keys(positions).forEach(function (id) {{
+      network.moveNode(id, positions[id].x, positions[id].y);
+    }});
+  }}
+
+  function highlightNode(nodeId) {{
+    var positions = network.getPositions();
+    var allEdges = edges.get();
+    var connectedNodeIds = new Set([nodeId]);
+    allEdges.forEach(function (e) {{
+      if (e.from === nodeId) connectedNodeIds.add(e.to);
+      if (e.to === nodeId) connectedNodeIds.add(e.from);
+    }});
+
+    nodes.update(nodes.get().map(function (n) {{
+      var isConnected = connectedNodeIds.has(n.id);
+      return {{
+        id: n.id,
+        color: {{
+          background: originalNodeColors[n.id], border: originalNodeColors[n.id],
+          opacity: isConnected ? 1 : DIM_NODE_OPACITY,
+        }},
+        font: {{ color: isConnected ? FULL_FONT_COLOR : DIM_FONT_COLOR, size: 16 }},
+      }};
+    }}));
+
+    edges.update(allEdges.map(function (e) {{
+      var isConnected = e.from === nodeId || e.to === nodeId;
+      return {{
+        id: e.id,
+        color: {{ color: isConnected ? HIGHLIGHT_COLOR : "#888888", opacity: isConnected ? 1 : DIM_EDGE_OPACITY }},
+        width: isConnected ? 3 : 1,
+        font: {{
+          color: isConnected ? FULL_FONT_COLOR : DIM_FONT_COLOR,
+          strokeWidth: isConnected ? 3 : 0, strokeColor: "#111111", size: 13,
+        }},
+      }};
+    }}));
+
+    pinPositions(positions);
+  }}
+
+  function resetHighlight() {{
+    var positions = network.getPositions();
+    nodes.update(nodes.get().map(function (n) {{
+      return {{
+        id: n.id,
+        color: {{ background: originalNodeColors[n.id], border: originalNodeColors[n.id], opacity: 1 }},
+        font: {{ color: FULL_FONT_COLOR, size: 16 }},
+      }};
+    }}));
+    edges.update(edges.get().map(function (e) {{
+      return {{
+        id: e.id,
+        color: {{ color: "#888888", opacity: 1 }},
+        width: 1,
+        font: {{ color: FULL_FONT_COLOR, strokeWidth: 3, strokeColor: "#111111", size: 13 }},
+      }};
+    }}));
+    pinPositions(positions);
+  }}
+
+  function closePanel() {{
+    document.getElementById('side-panel').classList.remove('open');
+    network.unselectAll();
+    resetHighlight();
+  }}
+
+  // --- Bridge locate call --------------------------------------------------
+  // Fires a request at the local bridge.py process. Requires bridge.py to
+  // be running and reachable on BRIDGE.url -- if it's not, this surfaces a
+  // clear inline error instead of failing silently.
+  function locateInExcel(sheet, cell, statusEl, btnEl) {{
+    if (!BRIDGE.enabled) {{
+      statusEl.textContent = "Bridge not configured for this export.";
+      statusEl.className = "locate-status err";
+      return;
+    }}
+    btnEl.disabled = true;
+    statusEl.textContent = "Locating...";
+    statusEl.className = "locate-status";
+    fetch(BRIDGE.url, {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify({{
+        file_path: BRIDGE.filePath,
+        workbook_name_hint: BRIDGE.workbookNameHint,
+        sheet: sheet,
+        cell: cell,
+      }}),
+    }})
+      .then(function (resp) {{ return resp.json(); }})
+      .then(function (data) {{
+        statusEl.textContent = data.message || (data.ok ? "Done." : "Failed.");
+        statusEl.className = "locate-status " + (data.ok ? "ok" : "err");
+      }})
+      .catch(function (err) {{
+        statusEl.textContent = "Couldn't reach the bridge (is bridge.py running?): " + err;
+        statusEl.className = "locate-status err";
+      }})
+      .finally(function () {{ btnEl.disabled = false; }});
+  }}
+
+  function makeLocateButton(sheet, cell) {{
+    var btn = document.createElement('button');
+    btn.className = 'locate-btn';
+    btn.textContent = 'Open ' + sheet + '!' + cell;
+    var status = document.createElement('span');
+    status.className = 'locate-status';
+    btn.addEventListener('click', function () {{ locateInExcel(sheet, cell, status, btn); }});
+    var wrap = document.createElement('div');
+    wrap.appendChild(btn);
+    wrap.appendChild(status);
+    return wrap;
+  }}
+
+  // Renders one fed-by/fed-to entry. For description/value edges this now
+  // shows the FULL evidence -- not just the merged sentence -- as one
+  // "match row" per matched cell pair, each with its own locate buttons:
+  //   description edge -> one row per topMatches entry (multiple
+  //     corroborating text-pairs, each independently clickable)
+  //   value edge        -> one row for the resolved cellA/cellB pair
+  //   formula/named_range -> unchanged, just the count tag
+  function buildEdgeListItem(sheetName, edge, isUpstream) {{
+    var li = document.createElement('li');
+    var mainLine = document.createElement('div');
+    mainLine.textContent = sheetName;
+    if (edge.label) {{
+      var tag = document.createElement('span');
+      tag.className = 'tag';
+      tag.textContent = edge.label;
+      mainLine.appendChild(tag);
+    }}
+    li.appendChild(mainLine);
+
+    if (edge.method === 'description' && edge.topMatches && edge.topMatches.length) {{
+      // Fed-by list: this sheet's cell is cell_a, the other side is cell_b.
+      // Fed-to list: reverse -- this row's "other side" is source's cell_a.
+      edge.topMatches.forEach(function (m) {{
+        var row = document.createElement('div');
+        row.className = 'match-row';
+        var text = document.createElement('div');
+        text.className = 'match-text';
+        text.textContent = '"' + m.text_a + '" ~ "' + m.text_b + '"';
+        var score = document.createElement('span');
+        score.className = 'match-score';
+        score.textContent = m.score + '%';
+        text.appendChild(score);
+        row.appendChild(text);
+
+        var btnRow = document.createElement('div');
+        btnRow.className = 'locate-buttons';
+        if (m.cell_a) btnRow.appendChild(makeLocateButton(edge.from, m.cell_a));
+        if (m.cell_b) btnRow.appendChild(makeLocateButton(edge.to, m.cell_b));
+        row.appendChild(btnRow);
+        li.appendChild(row);
+      }});
+    }} else if (edge.method === 'value' && (edge.cellA || edge.cellB)) {{
+      var row = document.createElement('div');
+      row.className = 'match-row';
+      if (edge.evidenceDetail) {{
+        var text = document.createElement('div');
+        text.className = 'match-text';
+        text.textContent = edge.evidenceDetail;
+        row.appendChild(text);
+      }}
+      var btnRow = document.createElement('div');
+      btnRow.className = 'locate-buttons';
+      if (edge.cellA) btnRow.appendChild(makeLocateButton(edge.from, edge.cellA));
+      if (edge.cellB) btnRow.appendChild(makeLocateButton(edge.to, edge.cellB));
+      row.appendChild(btnRow);
+      li.appendChild(row);
+    }} else if (edge.evidenceDetail) {{
+      var evidence = document.createElement('span');
+      evidence.className = 'evidence-detail';
+      evidence.textContent = edge.evidenceDetail;
+      li.appendChild(evidence);
+    }}
+
+    return li;
+  }}
+
+  function showPanel(nodeId) {{
+    document.getElementById('panel-title').textContent = nodeId;
+    var fedByList = document.getElementById('fed-by-list');
+    var fedToList = document.getElementById('fed-to-list');
+    fedByList.innerHTML = '';
+    fedToList.innerHTML = '';
+    var allEdges = edges.get();
+    var fedBy = allEdges.filter(function (e) {{ return e.to === nodeId; }});
+    var fedTo = allEdges.filter(function (e) {{ return e.from === nodeId; }});
+
+    if (fedBy.length === 0) {{
+      fedByList.innerHTML = '<li class="empty">Nothing feeds this sheet (input source)</li>';
+    }} else {{
+      fedBy.forEach(function (e) {{
+        fedByList.appendChild(buildEdgeListItem(e.from, e, true));
+      }});
+    }}
+
+    if (fedTo.length === 0) {{
+      fedToList.innerHTML = '<li class="empty">This sheet feeds nothing further</li>';
+    }} else {{
+      fedTo.forEach(function (e) {{
+        fedToList.appendChild(buildEdgeListItem(e.to, e, false));
+      }});
+    }}
+
+    if (!BRIDGE.enabled) {{
+      var warn = document.createElement('div');
+      warn.className = 'bridge-warning';
+      warn.textContent = 'Locate-in-Excel buttons need bridge.py running -- this export was opened without a bridge connection.';
+      fedByList.parentElement.appendChild(warn);
+    }}
+
+    document.getElementById('side-panel').classList.add('open');
+  }}
+
+  network.on("click", function (params) {{
+    if (params.nodes.length > 0) {{
+      var nodeId = params.nodes[0];
+      showPanel(nodeId);
+      highlightNode(nodeId);
+    }} else {{
+      closePanel();
+    }}
+  }});
+</script>
+</body></html>"""
+
+
+# ---------------------------------------------------------------------------
+# BRIDGE PROCESS MANAGEMENT (dashboard-side)
+# ---------------------------------------------------------------------------
+
+BRIDGE_PORT = 8765
+_BRIDGE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridge.py")
+
+
+def ensure_bridge_running(port: int = BRIDGE_PORT):
+    """
+    Starts bridge.py as a background subprocess if it isn't already
+    running/reachable, and returns the (possibly newly created) Popen
+    handle via session_state -- so repeat clicks in the same Streamlit
+    session reuse the same bridge process instead of spawning a new one
+    (and failing to bind the port) every time.
+
+    Reachability is checked with a quick GET /ping rather than just
+    trusting a stored Popen handle, since the person may have killed the
+    bridge window manually without dashboard.py's process object knowing.
+    """
+    import urllib.request
+
+    def _is_reachable():
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/ping", timeout=0.5) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    if _is_reachable():
+        return True, None
+
+    existing = st.session_state.get("_fld_bridge_proc") if st is not None else None
+    if existing is not None and existing.poll() is None:
+        # process object thinks it's alive but /ping failed -- give it a
+        # moment to finish starting up before giving up on it
+        import time
+        time.sleep(1.0)
+        if _is_reachable():
+            return True, None
+
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, _BRIDGE_SCRIPT, "--port", str(port)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        return False, f"Couldn't start bridge.py: {e}"
+
+    if st is not None:
+        st.session_state["_fld_bridge_proc"] = proc
+
+    import time
+    for _ in range(20):  # up to ~2s
+        if _is_reachable():
+            return True, None
+        time.sleep(0.1)
+
+    return False, "Started bridge.py but it isn't responding on /ping yet -- try again in a moment."
+
+
+def ensure_workbook_on_disk(file_bytes: bytes, file_name: str) -> str:
+    """
+    Writes the uploaded workbook to a stable temp path ONCE per uploaded
+    file (cached in session_state), so the bridge always has a real path
+    to open/find instead of re-writing a fresh temp copy on every locate
+    click. Streamlit only ever gives this app the uploaded bytes, never
+    the file's real path on the person's machine -- so, same as the
+    original locate_cell_in_excel, this is necessarily a working COPY,
+    not their original file.
+    """
+    cache_key = "_fld_workbook_path"
+    name_key = "_fld_workbook_path_name"
+    if st is not None and st.session_state.get(name_key) == file_name:
+        cached_path = st.session_state.get(cache_key)
+        if cached_path and os.path.exists(cached_path):
+            return cached_path
+
+    tmpdir = tempfile.mkdtemp(prefix="filing_lineage_bridge_")
+    safe_name = file_name or "workbook.xlsx"
+    path = os.path.join(tmpdir, safe_name)
+    with open(path, "wb") as fh:
+        fh.write(file_bytes)
+
+    if st is not None:
+        st.session_state[cache_key] = path
+        st.session_state[name_key] = file_name
+
+    return path
+
+
+# ---------------------------------------------------------------------------
+# STREAMLIT UI
+# ---------------------------------------------------------------------------
+
+if st is not None:
+    _cached_load_workbook_formulas = st.cache_data(show_spinner=False)(load_workbook_formulas)
+    _cached_load_raw_sheets = st.cache_data(show_spinner=False)(load_raw_sheets)
+    _cached_fallback_match = st.cache_data(show_spinner=False)(fallback_match_unreached_sheets)
+
+    @st.cache_resource(show_spinner=False)
+    def _cached_open_workbooks(file_bytes, _name):
+        wb_values = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+        wb_formulas = load_workbook(io.BytesIO(file_bytes), data_only=False, read_only=True)
+        return wb_values, wb_formulas
+
+
+def run_app():
+    st.set_page_config(page_title="Filing Lineage", layout="wide")
+    st.title("Filing-Centric Lineage")
+    st.caption("Pick your filing reference sheet -> trace every real formula link feeding it -> fuzzy-fallback for anything formulas don't reach.")
+
+    uploaded = st.file_uploader("Upload workbook", type=["xlsx", "xls"])
+    if uploaded is None:
+        st.info("Upload your workbook to get started.")
+        return
+
+    file_bytes = uploaded.getvalue()
+
+    if st.session_state.get("_fld_name") != uploaded.name:
+        st.session_state.pop("fld_lineage", None)
+        st.session_state["_fld_name"] = uploaded.name
+
+    with st.spinner("Reading formulas and defined names..."):
+        formulas, sheetnames, defined_name_map = _cached_load_workbook_formulas(file_bytes)
+    with st.spinner("Reading sheet values..."):
+        raw_sheets = _cached_load_raw_sheets(file_bytes)
+
+    st.success(f"Loaded {len(sheetnames)} sheets, {len(formulas)} formulas, {len(defined_name_map)} defined name(s).")
+
+    st.subheader("1. Filing reference sheet")
+    default_idx = next((i for i, s in enumerate(sheetnames) if "taxable income" in s.lower()), 0)
+    root_sheet = st.selectbox("This sheet is the root/output node -- the final aggregation sheet.", sheetnames, index=default_idx)
+
+    st.subheader("2. Final output cell (Taxable Income / Line 30)")
+    input_mode = st.radio(
+        "How do you want to specify it?",
+        ["Enter cell reference directly", "Pick from auto-detected candidates"],
+        horizontal=True,
+    )
+
+    if input_mode == "Enter cell reference directly":
+        cell_ref = st.text_input("Cell reference on the filing reference sheet (e.g. B30)", value="")
+        if cell_ref.strip():
+            wb_values, wb_formulas = _cached_open_workbooks(file_bytes, uploaded.name)
+            if root_sheet not in wb_values.sheetnames:
+                info = None
+            else:
+                info = lookup_cell_direct(wb_values[root_sheet], wb_formulas[root_sheet], cell_ref)
+            if info is None:
+                st.error(f"Couldn't parse or find '{cell_ref}' on {root_sheet} -- check the reference (e.g. B30).")
+                final_output_desc = None
+            else:
+                label_text = f'"{info["label"]}"' if info["label"] else "(no label found in column A)"
+                if info["value"] is None and info["formula"]:
+                    st.warning(
+                        f"Row {info['row']}, col {info['col']}: {label_text}, formula {info['formula']} -- "
+                        f"no cached value (this workbook wasn't last saved by Excel itself, so openpyxl can't "
+                        f"read a computed result). The formula and label look fine to use regardless."
+                    )
+                else:
+                    st.success(f"Row {info['row']}, col {info['col']}: {label_text} = {info['value']}")
+                final_output_desc = f'{label_text} (cell {info["col"]}{info["row"]}) on {root_sheet}, value {info["value"]}'
+        else:
+            st.info("Enter a cell reference to confirm it before building the lineage.")
+            final_output_desc = None
+    else:
+        candidates = detect_final_output_cell(raw_sheets[root_sheet])
+        if candidates:
+            options = [f"Row {r}, col {c}: \"{text}\" (match {score}%)" for r, c, text, score in candidates]
+            choice_idx = st.selectbox("Best guesses, ranked -- confirm or pick a different one:", range(len(options)), format_func=lambda i: options[i])
+            chosen = candidates[choice_idx]
+            final_output_desc = f'"{chosen[2]}" (row {chosen[0]}, col {chosen[1]}) on {root_sheet}'
+        else:
+            st.warning("No row matched 'Taxable Income' / 'Line 30' well -- switch to direct entry instead.")
+            final_output_desc = None
+
+    st.subheader("3. Build the lineage")
+    with st.expander("Line-schedule naming pattern (advanced)"):
+        st.write(
+            "Sheets matching this pattern are treated as calculation/support schedules "
+            "(Process node) even if nothing formula-feeds them -- e.g. \"L20\", \"Line_15\", "
+            "\"Sch M-1\" are line-item schedules for the return, not raw data sources, even "
+            "when they're self-contained. Adjust if your tabs follow a different convention."
+        )
+        line_schedule_pattern = st.text_input(
+            "Regex (case-insensitive, matched from the start of the sheet name)",
+            value=LINE_SCHEDULE_PATTERN_DEFAULT,
+        )
+        test_name = st.text_input("Test a sheet name against this pattern", value="L20 Depreciation")
+        if test_name:
+            matched = matches_line_schedule_pattern(test_name, line_schedule_pattern)
+            st.caption(("Matches" if matched else "Does not match") + f" -- \"{test_name}\"")
+
+    if st.button("Trace lineage from this root", type="primary", disabled=final_output_desc is None):
+        with st.spinner("Tracing formulas backward from root..."):
+            traced_edges, visited = trace_lineage_from_root(root_sheet, formulas, defined_name_map)
+        unmapped = [s for s in sheetnames if s not in visited]
+        with st.spinner(f"Running fallback matching on {len(unmapped)} unreached sheet(s)..."):
+            fallback_edges = _cached_fallback_match(tuple(unmapped), tuple(sorted(visited)), raw_sheets)
+        lineage = classify_and_assemble(root_sheet, traced_edges, fallback_edges, final_output_desc, line_schedule_pattern)
+        st.session_state["fld_lineage"] = lineage
+
+        excluded = [s for s in unmapped if s not in fallback_edges]
+        if excluded:
+            st.warning(f"{len(excluded)} sheet(s) had no formula path AND no match clearing {CONFIDENCE_THRESHOLD}% -- excluded: {', '.join(excluded)}")
+
+    if "fld_lineage" in st.session_state and st.session_state["fld_lineage"].get("schema_version") != LINEAGE_SCHEMA_VERSION:
+        st.session_state.pop("fld_lineage", None)
+        st.info("The lineage format changed since your last run -- click 'Trace lineage from this root' again to rebuild it.")
+
+    if "fld_lineage" in st.session_state:
+        lineage = st.session_state["fld_lineage"]
+
+        st.divider()
+        st.subheader("4. Result")
+        nodes_df = pd.DataFrame(lineage["nodes"])
+        rel_df = pd.DataFrame(lineage["relationships"])
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("**Nodes**")
+            st.dataframe(nodes_df, use_container_width=True, hide_index=True)
+        with col2:
+            st.write("**Relationships**")
+            st.dataframe(rel_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("4a. Fuzzy match evidence")
+        st.caption(
+            "The same evidence shown here is also available directly inside the exported diagram's side "
+            "panel (click any sheet), with its own locate buttons once the bridge is running."
+        )
+        fallback_evidence = lineage.get("fallback_evidence", {})
+        if not fallback_evidence:
+            st.caption("No fuzzy-matched (description/value) connections in this lineage -- every sheet was linked by a real formula.")
+        else:
+            for sheet, info in sorted(fallback_evidence.items()):
+                parent = info["parent"]
+                with st.expander(f"{sheet}  ~  {parent}   ({info['tier']}, {info.get('match_score', '?')}%)"):
+                    st.write(info.get("evidence_detail", ""))
+                    if info["tier"] == "description" and info.get("top_matches"):
+                        for idx, m in enumerate(info["top_matches"]):
+                            st.markdown(
+                                f"**{idx + 1}.** `{m['text_a']}` (cell `{m.get('cell_a') or '?'}` on **{sheet}**) "
+                                f"~ `{m['text_b']}` (cell `{m.get('cell_b') or '?'}` on **{parent}**) -- score {m['score']}"
+                            )
+                    elif info["tier"] == "value" and info.get("cell_a") and info.get("cell_b"):
+                        st.markdown(f"Shared value cell: `{sheet}!{info['cell_a']}` ~ `{parent}!{info['cell_b']}`")
+
+        st.divider()
+        st.subheader("4b. Value-overlap lineage (copy-pasted values) -- Excel export")
+        value_tier_count = sum(1 for r in lineage["relationships"] if r.get("method") == "value")
+        if value_tier_count == 0:
+            st.caption("No value-overlap connections in this lineage -- nothing to export here.")
+        else:
+            st.caption(
+                f"{value_tier_count} value-overlap connection(s): sheet pairs linked only by shared data "
+                "values, with no formula link and no label match. In a workpaper this is typically where "
+                "a number was copy-pasted or manually re-typed between sheets rather than formula-fed. "
+                "The export below lists every matched value with both sides' cell reference (up to "
+                f"{MAX_VALUES_FOR_EXPORT_PER_EDGE} values per connection)."
+            )
+            st.download_button(
+                "Download value-overlap lineage (xlsx)",
+                data=value_overlap_lineage_to_excel_bytes(lineage),
+                file_name="value_overlap_lineage.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        st.divider()
+        st.subheader("5. Outputs")
+
+        edge_filter_label = st.selectbox(
+            "Connections to show in the visual",
+            list(EDGE_FILTER_OPTIONS.keys()),
+            index=0,
+            help=(
+                "Display-only -- doesn't change node classification, confidence scores, "
+                "or the tables/exports above, which always reflect the full lineage. This "
+                "just controls what's drawn (and traversed) in the diagram itself."
+            ),
+        )
+        allowed_methods = EDGE_FILTER_OPTIONS[edge_filter_label]
+        is_filtered = allowed_methods != EDGE_FILTER_OPTIONS["All connections (formula + named range + fuzzy matches)"]
+        visual_lineage = filter_lineage_by_methods(lineage, allowed_methods) if is_filtered else lineage
+        if is_filtered and len(visual_lineage["nodes"]) < len(lineage["nodes"]):
+            hidden = len(lineage["nodes"]) - len(visual_lineage["nodes"])
+            st.caption(f"{hidden} sheet(s) hidden from the visual -- only reachable via connections this filter excludes.")
+
+        use_bridge = st.checkbox(
+            "Enable 'Open in Excel' buttons in the diagram (starts a local bridge process)",
+            value=True,
+            help="Requires Windows + pywin32 + Excel installed. Starts bridge.py in the background if it isn't already running.",
+        )
+
+        dl_col, vis_col, json_col = st.columns(3)
+
+        with dl_col:
+            st.download_button(
+                "Download Excel", data=lineage_to_excel_bytes(lineage),
+                file_name="filing_lineage.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        with vis_col:
+            if st.button("Open Visual in New Tab"):
+                bridge_port = None
+                workbook_path = None
+                if use_bridge:
+                    ok, err = ensure_bridge_running(BRIDGE_PORT)
+                    if ok:
+                        bridge_port = BRIDGE_PORT
+                        workbook_path = ensure_workbook_on_disk(file_bytes, uploaded.name)
+                    else:
+                        st.warning(f"Locate bridge unavailable -- diagram will open without 'Open in Excel' buttons. ({err})")
+
+                html = build_lineage_visual_html(
+                    visual_lineage, filter_label=edge_filter_label if is_filtered else None,
+                    bridge_port=bridge_port, file_path=workbook_path, workbook_name_hint=uploaded.name,
+                )
+                tmpdir = tempfile.mkdtemp(prefix="filing_lineage_")
+                html_path = os.path.join(tmpdir, "lineage_visual.html")
+                with open(html_path, "w", encoding="utf-8") as f:
+                    f.write(html)
+                webbrowser.open(f"file://{html_path}")
+                st.success("Opened in a new browser tab (same machine this app is running on).")
+
+        with json_col:
+            st.download_button(
+                "Download JSON", data=json.dumps(lineage, indent=2),
+                file_name="filing_lineage.json", mime="application/json",
+            )
+
+        st.divider()
+        st.subheader("6. Combined downstream flow from selected inputs")
+        input_sources = sorted(n["sheet_name"] for n in lineage["nodes"] if n["classification"] == "Input source")
+
+        if not input_sources:
+            st.info("No sheets are currently classified as Input source in this lineage.")
+        else:
+            selected_inputs = st.multiselect(
+                "Pick one or more input sheets -- their combined path(s) to the filing output will be merged into one flow:",
+                input_sources,
+            )
+
+            if not selected_inputs:
+                st.info("Select at least one input sheet to trace its combined flow to the filing output.")
+            else:
+                downstream = get_downstream_lineage_multi(lineage, selected_inputs)
+
+                if downstream is None or len(downstream["nodes"]) <= len(selected_inputs) and len(downstream["relationships"]) == 0:
+                    st.warning("None of the selected sheets lead anywhere further in this lineage -- no downstream path found.")
+                else:
+                    reached_root = lineage["filing_reference"] in {n["sheet_name"] for n in downstream["nodes"]}
+                    if reached_root:
+                        st.success(
+                            f"Combined path from {len(selected_inputs)} selected input(s) reaches the filing output "
+                            f"through {len(downstream['nodes'])} sheet(s) total."
+                        )
+                    else:
+                        st.warning(
+                            f"Combined selection touches {len(downstream['nodes']) - len(selected_inputs)} downstream "
+                            f"sheet(s), but no path reaches the filing output in this lineage."
+                        )
+
+                    down_col1, down_col2 = st.columns(2)
+                    with down_col1:
+                        st.dataframe(pd.DataFrame(downstream["nodes"]), use_container_width=True, hide_index=True)
+                    with down_col2:
+                        st.dataframe(pd.DataFrame(downstream["relationships"]), use_container_width=True, hide_index=True)
+
+                    dd_col1, dd_col2, dd_col3 = st.columns(3)
+                    combined_tag = "_".join(s.replace(" ", "-") for s in selected_inputs)[:60]
+                    with dd_col1:
+                        st.download_button(
+                            "Download this path (xlsx)", data=lineage_to_excel_bytes(downstream),
+                            file_name=f"combined_downstream_{combined_tag}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="downstream_xlsx",
+                        )
+                    with dd_col2:
+                        if st.button("Open this path's visual in new tab", key="downstream_visual"):
+                            visual_downstream = (
+                                filter_lineage_by_methods(downstream, allowed_methods) if is_filtered else downstream
+                            )
+                            bridge_port = None
+                            workbook_path = None
+                            if use_bridge:
+                                ok, err = ensure_bridge_running(BRIDGE_PORT)
+                                if ok:
+                                    bridge_port = BRIDGE_PORT
+                                    workbook_path = ensure_workbook_on_disk(file_bytes, uploaded.name)
+                                else:
+                                    st.warning(f"Locate bridge unavailable. ({err})")
+                            html = build_lineage_visual_html(
+                                visual_downstream, filter_label=edge_filter_label if is_filtered else None,
+                                bridge_port=bridge_port, file_path=workbook_path, workbook_name_hint=uploaded.name,
+                            )
+                            tmpdir = tempfile.mkdtemp(prefix="filing_lineage_downstream_")
+                            html_path = os.path.join(tmpdir, "downstream_visual.html")
+                            with open(html_path, "w", encoding="utf-8") as f:
+                                f.write(html)
+                            webbrowser.open(f"file://{html_path}")
+                            st.success("Opened in a new browser tab.")
+                    with dd_col3:
+                        st.download_button(
+                            "Download this path (json)", data=json.dumps(downstream, indent=2),
+                            file_name=f"combined_downstream_{combined_tag}.json", mime="application/json",
+                            key="downstream_json",
+                        )
+
+
+if __name__ == "__main__":
+    if st is None:
+        raise SystemExit("Streamlit is required to run this app: pip install streamlit")
+    run_app()
