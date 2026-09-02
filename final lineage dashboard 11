@@ -795,12 +795,27 @@ EDGE_FILTER_OPTIONS = {
 def filter_lineage_by_methods(lineage: dict, allowed_methods: set) -> dict:
     """
     Returns a lineage-shaped subgraph containing only relationships whose
-    "method" is in allowed_methods, and only nodes still reachable from
-    the root by walking backward through those surviving edges -- so
-    restricting to "direct formulas only", for instance, also drops any
-    sheet that was ONLY in the lineage because of a fuzzy fallback match
-    with no formula path of its own, rather than leaving it floating
-    disconnected in the diagram.
+    "method" is in allowed_methods, plus the nodes still reachable through
+    those surviving edges -- so restricting to "direct formulas only", for
+    instance, also drops any sheet that was ONLY in the lineage because of
+    a fuzzy fallback match with no formula path of its own, rather than
+    leaving it floating disconnected in the diagram.
+
+    Two anchor modes, auto-selected by whether this lineage is a combined
+    downstream subgraph (has "combined_from") or the full lineage:
+
+      Full lineage: anchor on the root, walk BACKWARD through surviving
+        edges. Standard "what still feeds the filing output" view.
+
+      Combined downstream subgraph: anchor on the sheet(s) the user
+        explicitly selected and walk FORWARD through surviving edges.
+        The selected sheet(s) always stay in the diagram even if their
+        OWN connecting edge is exactly what got filtered out -- otherwise
+        the very sheet you picked to view can vanish from its own
+        combined view, which is what walking backward-from-root always
+        did (it only kept a sheet if the surviving edges still connected
+        it all the way to the root, dropping it entirely if, say, its
+        only link was a named range and you filtered to formulas-only).
 
     This is display-only: node classification (Input source/Process/
     Output), confidence scores, and every export/table elsewhere in the
@@ -811,23 +826,38 @@ def filter_lineage_by_methods(lineage: dict, allowed_methods: set) -> dict:
     """
     root = lineage["filing_reference"]
     filtered_rels = [r for r in lineage["relationships"] if r.get("method") in allowed_methods]
-
-    backward = {}  # dst -> [src, ...]
-    for r in filtered_rels:
-        backward.setdefault(r["target"], []).append(r["source"])
-
-    visited = {root}
-    frontier = [root]
-    while frontier:
-        next_frontier = []
-        for current in frontier:
-            for src in backward.get(current, []):
-                if src not in visited:
-                    visited.add(src)
-                    next_frontier.append(src)
-        frontier = next_frontier
-
     node_map = {n["sheet_name"]: n for n in lineage["nodes"]}
+    combined_from = lineage.get("combined_from")
+
+    if combined_from:
+        forward = {}  # src -> [dst, ...]
+        for r in filtered_rels:
+            forward.setdefault(r["source"], []).append(r["target"])
+        visited = {s for s in combined_from if s in node_map}  # anchors always kept, even if isolated
+        frontier = list(visited)
+        while frontier:
+            next_frontier = []
+            for current in frontier:
+                for dst in forward.get(current, []):
+                    if dst not in visited:
+                        visited.add(dst)
+                        next_frontier.append(dst)
+            frontier = next_frontier
+    else:
+        backward = {}  # dst -> [src, ...]
+        for r in filtered_rels:
+            backward.setdefault(r["target"], []).append(r["source"])
+        visited = {root}
+        frontier = [root]
+        while frontier:
+            next_frontier = []
+            for current in frontier:
+                for src in backward.get(current, []):
+                    if src not in visited:
+                        visited.add(src)
+                        next_frontier.append(src)
+            frontier = next_frontier
+
     kept_rels = [r for r in filtered_rels if r["source"] in visited and r["target"] in visited]
 
     return {
