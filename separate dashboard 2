@@ -757,58 +757,96 @@ def lineage_to_excel_bytes(lineage: dict) -> bytes:
     return buf.getvalue()
 
 
-def value_overlap_lineage_to_excel_bytes(lineage: dict) -> bytes:
+def fuzzy_match_lineage_to_excel_bytes(lineage: dict) -> bytes:
     """
-    Downloadable Excel of every value-overlap ("value" tier) connection in
-    this lineage -- one row per matched shared value, with both sides'
-    sheet name, cell reference, and the actual value that appears in both
-    places. In a tax workpaper this is typically the "copy-pasted number"
-    lineage: a value with no formula link and no label match between the
-    two sheets, but the same number sitting in both -- i.e. it was
-    manually re-entered or pasted rather than formula-fed.
+    Downloadable Excel of every fuzzy-matched (non-formula) connection in
+    this lineage -- both "value" tier (shared data values) and
+    "description" tier (matched sheet/row labels) -- one row per matched
+    item, with both sides' sheet name, cell reference, and what actually
+    matched. In a tax workpaper this is typically the "no formula link"
+    lineage: numbers or labels that line up between two sheets without any
+    formula tying them together, usually because a value was copy-pasted
+    or manually re-typed rather than formula-fed.
 
-    One row per (relationship, shared value) pair -- NOT one row per
-    relationship -- since a single sheet-to-sheet value-tier connection
-    can rest on several independently-copied numbers, each with its own
+    Two sheets in the output workbook, since the two tiers carry
+    genuinely different evidence shapes:
+      "Value Overlap"     -- one row per shared value; Source Value and
+                              Target Value are the SAME number (that's
+                              what makes it a value-overlap match), each
+                              with its own cell reference on its own sheet.
+      "Description Match" -- one row per matched label pair; Source Text
+                              and Target Text are typically DIFFERENT
+                              wording that fuzzy-matched (e.g. "Total
+                              Revenue" ~ "Revenue Total"), each with its
+                              own cell reference.
+
+    One row per (relationship, matched item) pair -- NOT one row per
+    relationship -- since a single sheet-to-sheet connection can rest on
+    several independently-matched values or labels, each with its own
     source/target cell. A connection with no resolved cell-level detail
-    (value found in both sheets but its exact row couldn't be pinned down)
-    still gets one row so it isn't silently dropped, with blank cell
-    columns and the value column blank too.
+    still gets one row so it isn't silently dropped, with blank cell/text
+    columns.
     """
-    rows = []
-    for r in lineage["relationships"]:
-        if r.get("method") != "value":
-            continue
-        source, target = r["source"], r["target"]
-        locations = r.get("value_locations") or []
-        if not locations:
-            rows.append({
-                "Source Sheet": source, "Source Cell": None,
-                "Target Sheet": target, "Target Cell": None,
-                "Shared Value": None,
-                "Match Score (%)": r.get("match_score"),
-                "Overlap Count": r.get("overlap_count"),
-                "Overlap Total": r.get("overlap_total"),
-            })
-            continue
-        for loc in locations:
-            rows.append({
-                "Source Sheet": source, "Source Cell": loc.get("cell_a"),
-                "Target Sheet": target, "Target Cell": loc.get("cell_b"),
-                "Shared Value": loc.get("value"),
-                "Match Score (%)": r.get("match_score"),
-                "Overlap Count": r.get("overlap_count"),
-                "Overlap Total": r.get("overlap_total"),
-            })
+    value_rows = []
+    desc_rows = []
 
-    df = pd.DataFrame(rows, columns=[
-        "Source Sheet", "Source Cell", "Target Sheet", "Target Cell",
-        "Shared Value", "Match Score (%)", "Overlap Count", "Overlap Total",
+    for r in lineage["relationships"]:
+        method = r.get("method")
+        source, target = r["source"], r["target"]
+
+        if method == "value":
+            locations = r.get("value_locations") or []
+            if not locations:
+                value_rows.append({
+                    "Source Sheet": source, "Source Cell": None, "Source Value": None,
+                    "Target Sheet": target, "Target Cell": None, "Target Value": None,
+                    "Match Score (%)": r.get("match_score"),
+                    "Overlap Count": r.get("overlap_count"),
+                    "Overlap Total": r.get("overlap_total"),
+                })
+                continue
+            for loc in locations:
+                value_rows.append({
+                    "Source Sheet": source, "Source Cell": loc.get("cell_a"), "Source Value": loc.get("value"),
+                    "Target Sheet": target, "Target Cell": loc.get("cell_b"), "Target Value": loc.get("value"),
+                    "Match Score (%)": r.get("match_score"),
+                    "Overlap Count": r.get("overlap_count"),
+                    "Overlap Total": r.get("overlap_total"),
+                })
+
+        elif method == "description":
+            matches = r.get("top_matches") or []
+            if not matches:
+                desc_rows.append({
+                    "Source Sheet": source, "Source Cell": None, "Source Text": None,
+                    "Target Sheet": target, "Target Cell": None, "Target Text": None,
+                    "Match Score (%)": r.get("match_score"),
+                    "Corroborating Matches": r.get("corroborating_matches"),
+                })
+                continue
+            for m in matches:
+                desc_rows.append({
+                    "Source Sheet": source, "Source Cell": m.get("cell_a"), "Source Text": m.get("text_a"),
+                    "Target Sheet": target, "Target Cell": m.get("cell_b"), "Target Text": m.get("text_b"),
+                    "Match Score (%)": m.get("score"),
+                    "Corroborating Matches": r.get("corroborating_matches"),
+                })
+
+    value_df = pd.DataFrame(value_rows, columns=[
+        "Source Sheet", "Source Cell", "Source Value",
+        "Target Sheet", "Target Cell", "Target Value",
+        "Match Score (%)", "Overlap Count", "Overlap Total",
+    ])
+    desc_df = pd.DataFrame(desc_rows, columns=[
+        "Source Sheet", "Source Cell", "Source Text",
+        "Target Sheet", "Target Cell", "Target Text",
+        "Match Score (%)", "Corroborating Matches",
     ])
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Value Overlap Lineage")
+        value_df.to_excel(writer, index=False, sheet_name="Value Overlap")
+        desc_df.to_excel(writer, index=False, sheet_name="Description Match")
     return buf.getvalue()
 
 
@@ -1535,22 +1573,24 @@ def run_app():
                         st.markdown(f"Shared value cell: `{sheet}!{info['cell_a']}` ~ `{parent}!{info['cell_b']}`")
 
         st.divider()
-        st.subheader("4b. Value-overlap lineage (copy-pasted values) -- Excel export")
+        st.subheader("4b. Fuzzy-matched lineage (copy-pasted values & label matches) -- Excel export")
         value_tier_count = sum(1 for r in lineage["relationships"] if r.get("method") == "value")
-        if value_tier_count == 0:
-            st.caption("No value-overlap connections in this lineage -- nothing to export here.")
+        desc_tier_count = sum(1 for r in lineage["relationships"] if r.get("method") == "description")
+        if value_tier_count == 0 and desc_tier_count == 0:
+            st.caption("No fuzzy-matched (value or description) connections in this lineage -- nothing to export here.")
         else:
             st.caption(
-                f"{value_tier_count} value-overlap connection(s): sheet pairs linked only by shared data "
-                "values, with no formula link and no label match. In a workpaper this is typically where "
-                "a number was copy-pasted or manually re-typed between sheets rather than formula-fed. "
-                "The export below lists every matched value with both sides' cell reference (up to "
-                f"{MAX_VALUES_FOR_EXPORT_PER_EDGE} values per connection)."
+                f"{value_tier_count} value-overlap connection(s) and {desc_tier_count} description-match "
+                "connection(s): sheet pairs linked with no formula and no named-range reference -- either "
+                "the same number sitting in both sheets (value overlap, typically a copy-paste) or "
+                "similar row/column labels (description match). The export below has one sheet for each, "
+                f"with every matched item's cell reference on both sides (up to {MAX_VALUES_FOR_EXPORT_PER_EDGE} "
+                "values per value-overlap connection)."
             )
             st.download_button(
-                "Download value-overlap lineage (xlsx)",
-                data=value_overlap_lineage_to_excel_bytes(lineage),
-                file_name="value_overlap_lineage.xlsx",
+                "Download fuzzy-matched lineage (xlsx)",
+                data=fuzzy_match_lineage_to_excel_bytes(lineage),
+                file_name="fuzzy_matched_lineage.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
