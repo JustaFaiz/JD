@@ -84,6 +84,14 @@ CONFIDENCE_THRESHOLD = 70
 # Adjustable per-workbook via the UI, since naming conventions vary.
 LINE_SCHEDULE_PATTERN_DEFAULT = r"^(l|line)[\s_\-]?\d+|^(sch|schedule)\b"
 
+# Bumped whenever the shape of a lineage dict's relationships changes (e.g.
+# adding formula_count/method). A lineage object cached in Streamlit's
+# session_state from a previous version of this file won't have the new
+# keys, and the edge-label code would then silently render blank labels
+# instead of an error -- so the app checks this tag on load and discards
+# a stale cached lineage rather than displaying it half-populated.
+LINEAGE_SCHEMA_VERSION = 2
+
 
 def matches_line_schedule_pattern(sheet_name, pattern):
     if not pattern:
@@ -599,6 +607,7 @@ def classify_and_assemble(root_sheet, traced_edges, fallback_edges, final_output
         "final_output": final_output_desc,
         "nodes": nodes,
         "relationships": relationships,
+        "schema_version": LINEAGE_SCHEMA_VERSION,
     }
 
 
@@ -667,6 +676,7 @@ def get_downstream_lineage_multi(lineage: dict, start_sheets: list):
         "nodes": [node_map[s] for s in visited_nodes if s in node_map],
         "relationships": [rel_lookup[e] for e in sorted(visited_edges) if e in rel_lookup],
         "combined_from": valid_starts,
+        "schema_version": LINEAGE_SCHEMA_VERSION,
     }
 
 
@@ -1060,6 +1070,13 @@ def run_app():
         excluded = [s for s in unmapped if s not in fallback_edges]
         if excluded:
             st.warning(f"{len(excluded)} sheet(s) had no formula path AND no match clearing {CONFIDENCE_THRESHOLD}% -- excluded: {', '.join(excluded)}")
+
+    if "fld_lineage" in st.session_state and st.session_state["fld_lineage"].get("schema_version") != LINEAGE_SCHEMA_VERSION:
+        # Cached lineage was built by an older version of this file (before
+        # formula_count/method existed on relationships, for example) --
+        # discard it rather than render edges with blank labels.
+        st.session_state.pop("fld_lineage", None)
+        st.info("The lineage format changed since your last run -- click 'Trace lineage from this root' again to rebuild it.")
 
     if "fld_lineage" in st.session_state:
         lineage = st.session_state["fld_lineage"]
