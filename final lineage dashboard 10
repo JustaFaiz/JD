@@ -914,6 +914,11 @@ def build_lineage_visual_html(lineage: dict) -> str:
         edge_dicts.append({
             "from": r["source"], "to": r["target"], "arrows": "to",
             "label": label, "title": title,
+            # Carried separately (not just baked into the hover title) so
+            # the side panel can print it directly under each fed-by/fed-to
+            # entry -- evidence you'd otherwise only see by hovering a thin
+            # arrow. None/absent on real formula/named_range edges.
+            "evidenceDetail": r.get("evidence_detail"),
         })
     edges_json = json.dumps(edge_dicts)
 
@@ -950,6 +955,10 @@ def build_lineage_visual_html(lineage: dict) -> str:
   #side-panel ul {{ list-style:none; padding-left:0; margin:8px 0 0 0; }}
   #side-panel li {{ padding:6px 0; border-bottom:1px solid #2a2a2a; font-size:13px; }}
   #side-panel li .tag {{ color:#888; font-size:11px; margin-left:6px; }}
+  #side-panel li .evidence-detail {{
+    display:block; color:#aaa; font-size:11px; font-style:italic;
+    margin-top:3px; line-height:1.4; word-break:break-word;
+  }}
   #side-panel .empty {{ color:#777; font-size:13px; font-style:italic; }}
 </style></head>
 <body>
@@ -1087,6 +1096,26 @@ def build_lineage_visual_html(lineage: dict) -> str:
     resetHighlight();
   }}
 
+  function buildEdgeListItem(sheetName, edge) {{
+    var li = document.createElement('li');
+    var mainLine = document.createElement('div');
+    mainLine.textContent = sheetName;
+    if (edge.label) {{
+      var tag = document.createElement('span');
+      tag.className = 'tag';
+      tag.textContent = edge.label;
+      mainLine.appendChild(tag);
+    }}
+    li.appendChild(mainLine);
+    if (edge.evidenceDetail) {{
+      var evidence = document.createElement('span');
+      evidence.className = 'evidence-detail';
+      evidence.textContent = edge.evidenceDetail;
+      li.appendChild(evidence);
+    }}
+    return li;
+  }}
+
   function showPanel(nodeId) {{
     document.getElementById('panel-title').textContent = nodeId;
     var fedByList = document.getElementById('fed-by-list');
@@ -1101,15 +1130,7 @@ def build_lineage_visual_html(lineage: dict) -> str:
       fedByList.innerHTML = '<li class="empty">Nothing feeds this sheet (input source)</li>';
     }} else {{
       fedBy.forEach(function (e) {{
-        var li = document.createElement('li');
-        li.textContent = e.from;
-        if (e.label) {{
-          var tag = document.createElement('span');
-          tag.className = 'tag';
-          tag.textContent = e.label;
-          li.appendChild(tag);
-        }}
-        fedByList.appendChild(li);
+        fedByList.appendChild(buildEdgeListItem(e.from, e));
       }});
     }}
 
@@ -1117,15 +1138,7 @@ def build_lineage_visual_html(lineage: dict) -> str:
       fedToList.innerHTML = '<li class="empty">This sheet feeds nothing further</li>';
     }} else {{
       fedTo.forEach(function (e) {{
-        var li = document.createElement('li');
-        li.textContent = e.to;
-        if (e.label) {{
-          var tag = document.createElement('span');
-          tag.className = 'tag';
-          tag.textContent = e.label;
-          li.appendChild(tag);
-        }}
-        fedToList.appendChild(li);
+        fedToList.appendChild(buildEdgeListItem(e.to, e));
       }});
     }}
 
