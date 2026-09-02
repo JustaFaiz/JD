@@ -303,11 +303,35 @@ def load_workbook_formulas(file_bytes):
     return formulas, sheetnames, defined_name_map
 
 
+def _dedupe_headers(header):
+    """
+    Mirrors pandas' own historical duplicate-column handling (which
+    pd.read_excel used to do automatically): "Amount", "Amount" becomes
+    "Amount", "Amount.1". Without this, a workbook with two identically-
+    named columns on one sheet produces a DataFrame with duplicate column
+    labels, and df[col] then returns a mini-DataFrame instead of a single
+    Series -- silently breaking every .str/.replace()/.dropna() call
+    downstream that assumes a Series of scalars (surfaces as a confusing
+    "NDFrame.replace() takes ... positional arguments" TypeError).
+    """
+    seen = {}
+    deduped = []
+    for h in header:
+        if h in seen:
+            seen[h] += 1
+            deduped.append(f"{h}.{seen[h]}")
+        else:
+            seen[h] = 0
+            deduped.append(h)
+    return deduped
+
+
 def load_raw_sheets(file_bytes):
     """
     Builds {sheet_name: DataFrame} directly from a single data_only,
     read_only openpyxl pass -- header row becomes columns, same shape
-    pd.read_excel(sheet_name=None) would give.
+    pd.read_excel(sheet_name=None) would give (duplicate headers included,
+    see _dedupe_headers).
 
     PERFORMANCE: this replaces a separate pd.read_excel(sheet_name=None)
     call, which under the hood opens and re-parses the ENTIRE workbook a
@@ -325,6 +349,7 @@ def load_raw_sheets(file_bytes):
             continue
         header, *body = rows
         header = [h if h is not None else f"Unnamed: {i}" for i, h in enumerate(header)]
+        header = _dedupe_headers(header)
         df = pd.DataFrame(body, columns=header)
         raw_sheets[ws.title] = df
     wb.close()
