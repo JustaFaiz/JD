@@ -110,30 +110,69 @@ FULL_RANGE_ROW_CAP = 5000
 FULL_RANGE_COL_CAP = 200
 
 
-def extract_cross_sheet_refs(formula, current_sheet):
+def build_sheet_name_lookup(sheetnames):
+    """
+    Case-insensitive sheet-name lookup: {lowercased real name -> real name}.
+
+    Excel resolves cross-sheet formula references case-insensitively
+    (SHEET1!A1 and Sheet1!A1 are the same reference), but the literal text
+    stored in a formula can carry whatever case it was typed or generated
+    with -- especially in workbooks built or edited by scripts/exports
+    rather than typed by hand in Excel (SAP FICO, Longview, Corptax
+    exports all qualify). Comparing that raw formula text directly against
+    wb.sheetnames (which preserves each tab's real case), as this file
+    used to do, meant a case-mismatched reference silently produced a
+    "phantom" sheet name that matched nothing real: the real sheet was
+    left out of `visited`, still looked unreached, and got run back
+    through the fuzzy/value fallback matcher under its real name -- so a
+    sheet with a perfectly good formula link into the lineage could end
+    up looking, in the graph, like it was connected by nothing but a
+    coincidental copy-pasted value.
+    """
+    return {name.lower(): name for name in sheetnames}
+
+
+def _resolve_sheet_name(name, sheet_lookup):
+    if not name:
+        return name
+    if sheet_lookup is not None:
+        return sheet_lookup.get(name.lower(), name)
+    return name
+
+
+def extract_cross_sheet_refs(formula, current_sheet, sheet_lookup=None):
     refs = set()
+    current_lower = current_sheet.lower()
     for m in CELL_REF_RE.finditer(formula):
         sheet = m.group(1) or m.group(2)
-        if sheet and sheet != current_sheet:
-            refs.add(sheet)
+        if sheet:
+            sheet = _resolve_sheet_name(sheet, sheet_lookup)
+            if sheet.lower() != current_lower:
+                refs.add(sheet)
     for m in COLUMN_ONLY_RE.finditer(formula):
         sheet = m.group(1) or m.group(2)
-        if sheet and sheet != current_sheet:
-            refs.add(sheet)
+        if sheet:
+            sheet = _resolve_sheet_name(sheet, sheet_lookup)
+            if sheet.lower() != current_lower:
+                refs.add(sheet)
     for m in ROW_ONLY_RE.finditer(formula):
         sheet = m.group(1) or m.group(2)
-        if sheet and sheet != current_sheet:
-            refs.add(sheet)
+        if sheet:
+            sheet = _resolve_sheet_name(sheet, sheet_lookup)
+            if sheet.lower() != current_lower:
+                refs.add(sheet)
     return refs
 
 
-def extract_named_range_refs(formula, defined_name_map, current_sheet):
+def extract_named_range_refs(formula, defined_name_map, current_sheet, sheet_lookup=None):
     refs = set()
+    current_lower = current_sheet.lower()
     for m in NAME_TOKEN_RE.finditer(formula):
         token = m.group(1).lower()
         if token in defined_name_map:
             for sheet in defined_name_map[token]:
-                if sheet != current_sheet:
+                sheet = _resolve_sheet_name(sheet, sheet_lookup)
+                if sheet.lower() != current_lower:
                     refs.add(sheet)
     return refs
 
@@ -218,7 +257,17 @@ def load_raw_sheets(file_bytes):
 # BACKWARD TRAVERSAL FROM THE ROOT
 # ---------------------------------------------------------------------------
 
-def trace_lineage_from_root(root_sheet, formulas, defined_name_map):
+def trace_lineage_from_root(root_sheet, formulas, defined_name_map, sheetnames=None):
+    """
+    sheetnames: the workbook's real sheet names (wb.sheetnames), used to
+    build a case-insensitive lookup so a sheet reference typed/generated
+    with different case than the actual tab still resolves to that real
+    tab -- see build_sheet_name_lookup's docstring for why this matters.
+    Optional only for backward compatibility with any external caller
+    that doesn't have the list handy; always pass it when available.
+    """
+    sheet_lookup = build_sheet_name_lookup(sheetnames) if sheetnames else None
+
     edges = {}
     counts = {}
     visited = {root_sheet}
@@ -232,8 +281,8 @@ def trace_lineage_from_root(root_sheet, formulas, defined_name_map):
         next_frontier = []
         for current in frontier:
             for f in formulas_by_sheet.get(current, []):
-                direct_refs = extract_cross_sheet_refs(f, current)
-                named_refs = extract_named_range_refs(f, defined_name_map, current) - direct_refs
+                direct_refs = extract_cross_sheet_refs(f, current, sheet_lookup)
+                named_refs = extract_named_range_refs(f, defined_name_map, current, sheet_lookup) - direct_refs
                 all_refs = direct_refs | named_refs
 
                 for src in all_refs:
@@ -1560,7 +1609,7 @@ def run_app():
 
     if st.button("Trace lineage from this root", type="primary", disabled=final_output_desc is None):
         with st.spinner("Tracing formulas backward from root..."):
-            traced_edges, visited = trace_lineage_from_root(root_sheet, formulas, defined_name_map)
+            traced_edges, visited = trace_lineage_from_root(root_sheet, formulas, defined_name_map, sheetnames)
         unmapped = [s for s in sheetnames if s not in visited]
         with st.spinner(f"Running fallback matching on {len(unmapped)} unreached sheet(s)..."):
             fallback_edges = _cached_fallback_match(tuple(unmapped), tuple(sorted(visited)), raw_sheets)
