@@ -66,7 +66,9 @@ LINE_SCHEDULE_PATTERN_DEFAULT = r"^(l|line)[\s_\-]?\d+|^(sch|schedule)\b"
 
 # Bumped whenever the shape of a lineage dict's relationships changes --
 # see classify_and_assemble / the schema-mismatch check in run_app.
-LINEAGE_SCHEMA_VERSION = 6  # bumped: relationships now also carry value_locations (full shared-value/cell list) for value-tier edges
+LINEAGE_SCHEMA_VERSION = 7  # bumped: value-tier relationships now also carry is_flow_break (no formula
+                            # anywhere in the workbook ties the two sheets together), and the lineage
+                            # dict carries a top-level flow_break_count -- see apply_flow_break_detection
 
 
 def matches_line_schedule_pattern(sheet_name, pattern):
@@ -560,6 +562,67 @@ def fallback_match_unreached_sheets(unmapped_sheets, lineage_sheets, raw_sheets)
 
 
 # ---------------------------------------------------------------------------
+# FLOW BREAK DETECTION
+# ---------------------------------------------------------------------------
+# A "flow break" is a value-tier connection (two sheets share a raw number)
+# with no formula anywhere tying those two sheets together -- i.e. the
+# number looks copy-pasted or manually re-typed rather than linked, so it
+# won't recompute if the source changes.
+#
+# trace_lineage_from_root only proves the ABSENCE of a formula path back to
+# the filing root -- it never inspects formulas belonging to a sheet that
+# isn't itself already on the traced (visited) side, since the BFS only
+# reads formulas_by_sheet[current] for sheets already in the frontier. So
+# an unmapped sheet could still have a real formula referencing the exact
+# sheet it was value-matched against, just in a direction/component the
+# root-ward BFS never walks (e.g. the unmapped sheet formula-references its
+# match target, but nothing further up the chain ever formula-feeds root).
+# That's still a real formula link between those two sheets, and shouldn't
+# be flagged as a break. build_direct_formula_pairs scans every formula in
+# the workbook (not just the ones the root-ward trace visited) so that
+# check is a genuine "is there a formula ANYWHERE tying these two sheets
+# together", matching what "flow break" is supposed to mean.
+
+def build_direct_formula_pairs(formulas, defined_name_map, sheetnames=None):
+    sheet_lookup = build_sheet_name_lookup(sheetnames) if sheetnames else None
+    pairs = set()
+    formulas_by_sheet = {}
+    for (sheet, coord), f in formulas.items():
+        formulas_by_sheet.setdefault(sheet, []).append(f)
+
+    for sheet, sheet_formulas in formulas_by_sheet.items():
+        for f in sheet_formulas:
+            direct_refs = extract_cross_sheet_refs(f, sheet, sheet_lookup)
+            named_refs = extract_named_range_refs(f, defined_name_map, sheet, sheet_lookup)
+            for ref in direct_refs | named_refs:
+                pairs.add(frozenset({sheet, ref}))
+    return pairs
+
+
+def apply_flow_break_detection(lineage, formulas, defined_name_map, sheetnames=None):
+    """
+    Marks every value-tier relationship in `lineage` with is_flow_break
+    (True/False) and sets lineage["flow_break_count"]. Mutates and returns
+    the same lineage dict -- relationship dicts are also shared by
+    reference into get_downstream_lineage_multi / filter_lineage_by_methods
+    results, so downstream/filtered views automatically carry the flag too
+    without needing their own pass.
+    """
+    direct_formula_pairs = build_direct_formula_pairs(formulas, defined_name_map, sheetnames)
+    flow_breaks = []
+    for r in lineage["relationships"]:
+        if r.get("method") != "value":
+            r["is_flow_break"] = False
+            continue
+        pair = frozenset({r["source"], r["target"]})
+        r["is_flow_break"] = pair not in direct_formula_pairs
+        if r["is_flow_break"]:
+            flow_breaks.append(r)
+    lineage["flow_break_count"] = len(flow_breaks)
+    return lineage
+
+
+# ---------------------------------------------------------------------------
 # LINE 30 / TAXABLE INCOME AUTO-DETECTION
 # ---------------------------------------------------------------------------
 
@@ -845,6 +908,7 @@ def fuzzy_match_lineage_to_excel_bytes(lineage: dict) -> bytes:
 
         if method == "value":
             locations = r.get("value_locations") or []
+            is_flow_break = r.get("is_flow_break")
             if not locations:
                 value_rows.append({
                     "Source Sheet": source, "Source Cell": None, "Source Value": None,
@@ -852,6 +916,7 @@ def fuzzy_match_lineage_to_excel_bytes(lineage: dict) -> bytes:
                     "Match Score (%)": r.get("match_score"),
                     "Overlap Count": r.get("overlap_count"),
                     "Overlap Total": r.get("overlap_total"),
+                    "Is Flow Break": is_flow_break,
                 })
                 continue
             for loc in locations:
@@ -861,6 +926,7 @@ def fuzzy_match_lineage_to_excel_bytes(lineage: dict) -> bytes:
                     "Match Score (%)": r.get("match_score"),
                     "Overlap Count": r.get("overlap_count"),
                     "Overlap Total": r.get("overlap_total"),
+                    "Is Flow Break": is_flow_break,
                 })
 
         elif method == "description":
@@ -884,7 +950,7 @@ def fuzzy_match_lineage_to_excel_bytes(lineage: dict) -> bytes:
     value_df = pd.DataFrame(value_rows, columns=[
         "Source Sheet", "Source Cell", "Source Value",
         "Target Sheet", "Target Cell", "Target Value",
-        "Match Score (%)", "Overlap Count", "Overlap Total",
+        "Match Score (%)", "Overlap Count", "Overlap Total", "Is Flow Break",
     ])
     desc_df = pd.DataFrame(desc_rows, columns=[
         "Source Sheet", "Source Cell", "Source Text",
@@ -947,7 +1013,15 @@ def _edge_label_and_title(r: dict) -> tuple:
         score = r.get("match_score")
         label = f"~val {score:.0f}%" if score is not None else "~val"
         detail = r.get("evidence_detail") or ""
-        title = f"{src} matched to {dst} by shared data values -- no direct formula link found. {detail}"
+        if r.get("is_flow_break"):
+            label = "\u26a0 " + label
+            title = (
+                f"FLOW BREAK: {src} and {dst} share a value, but no formula anywhere in this "
+                f"workbook ties the two sheets together -- looks copy-pasted or manually re-typed "
+                f"rather than linked. {detail}"
+            )
+        else:
+            title = f"{src} matched to {dst} by shared data values -- no direct formula link found. {detail}"
     else:
         label = ""
         title = f"{src} feeds {dst}"
@@ -994,14 +1068,17 @@ def build_lineage_visual_html(lineage: dict, filter_label: str = None,
     ])
 
     edge_dicts = []
+    any_flow_breaks = False
     for r in lineage["relationships"]:
         label, title = _edge_label_and_title(r)
         method = r.get("method")
+        is_flow_break = bool(r.get("is_flow_break"))
         entry = {
             "from": r["source"], "to": r["target"], "arrows": "to",
             "label": label, "title": title,
             "method": method,
             "evidenceDetail": r.get("evidence_detail"),
+            "isFlowBreak": is_flow_break,
         }
         if method == "value":
             entry["cellA"] = r.get("cell_a")
@@ -1009,6 +1086,16 @@ def build_lineage_visual_html(lineage: dict, filter_label: str = None,
         elif method == "description":
             # top_matches entries already carry text_a/text_b/score/cell_a/cell_b
             entry["topMatches"] = r.get("top_matches") or []
+        if is_flow_break:
+            any_flow_breaks = True
+            # Distinct styling so a broken (copy-pasted, no formula anywhere)
+            # link is visually obvious at a glance, not just in the hover
+            # text -- red + dashed, vs. the default solid gray every other
+            # edge (formula, named range, description, or a "clean" value
+            # match that does have a formula elsewhere tying it) still uses.
+            entry["color"] = {"color": "#e74c3c", "highlight": "#ff6b6b", "hover": "#ff6b6b"}
+            entry["dashes"] = [6, 4]
+            entry["width"] = 2
         edge_dicts.append(entry)
     edges_json = json.dumps(edge_dicts)
 
@@ -1029,6 +1116,11 @@ def build_lineage_visual_html(lineage: dict, filter_label: str = None,
         legend_extra += (
             "Click a fuzzy-matched edge's \"Open in Excel\" buttons in the side panel to jump straight "
             "to the matched cell -- requires the locate-bridge (bridge.py) to still be running.<br>"
+        )
+    if any_flow_breaks:
+        legend_extra += (
+            "<b style=\"color:#ff6b6b\">Red dashed</b> = flow break: a shared value with no formula "
+            "anywhere in the workbook tying the two sheets together -- looks copy-pasted rather than linked.<br>"
         )
 
     return f"""<!doctype html>
@@ -1083,6 +1175,10 @@ def build_lineage_visual_html(lineage: dict, filter_label: str = None,
   #side-panel .empty {{ color:#777; font-size:13px; font-style:italic; }}
   #side-panel .bridge-warning {{
     color:#f2c94c; font-size:11px; margin-top:10px; padding:8px; background:#2a2410; border-radius:5px;
+  }}
+  #side-panel .flow-break-badge {{
+    color:#ff6b6b; font-size:11px; font-weight:bold; margin-bottom:6px;
+    padding:4px 8px; background:#3a1a1a; border-radius:4px; display:inline-block;
   }}
 </style></head>
 <body>
@@ -1139,6 +1235,18 @@ def build_lineage_visual_html(lineage: dict, filter_label: str = None,
   var originalNodeColors = {{}};
   nodes.get().forEach(function (n) {{ originalNodeColors[n.id] = n.color; }});
 
+  // Flow-break edges are colored/dashed red at creation time (see isFlowBreak
+  // above); highlightNode/resetHighlight below used to hardcode every edge
+  // back to plain gray, which would silently erase that styling the moment
+  // anyone clicked a node. Capture the real per-edge color/dashes up front
+  // so both functions can restore THIS edge's actual look, not a generic one.
+  var originalEdgeColors = {{}};
+  var originalEdgeDashes = {{}};
+  edges.get().forEach(function (e) {{
+    originalEdgeColors[e.id] = (e.color && e.color.color) ? e.color.color : "#888888";
+    originalEdgeDashes[e.id] = e.dashes || false;
+  }});
+
   function pinPositions(positions) {{
     Object.keys(positions).forEach(function (id) {{
       network.moveNode(id, positions[id].x, positions[id].y);
@@ -1168,10 +1276,12 @@ def build_lineage_visual_html(lineage: dict, filter_label: str = None,
 
     edges.update(allEdges.map(function (e) {{
       var isConnected = e.from === nodeId || e.to === nodeId;
+      var baseColor = originalEdgeColors[e.id] || "#888888";
       return {{
         id: e.id,
-        color: {{ color: isConnected ? HIGHLIGHT_COLOR : "#888888", opacity: isConnected ? 1 : DIM_EDGE_OPACITY }},
-        width: isConnected ? 3 : 1,
+        color: {{ color: isConnected ? HIGHLIGHT_COLOR : baseColor, opacity: isConnected ? 1 : DIM_EDGE_OPACITY }},
+        width: isConnected ? 3 : (e.isFlowBreak ? 2 : 1),
+        dashes: originalEdgeDashes[e.id],
         font: {{
           color: isConnected ? FULL_FONT_COLOR : DIM_FONT_COLOR,
           strokeWidth: isConnected ? 3 : 0, strokeColor: "#111111", size: 13,
@@ -1194,8 +1304,9 @@ def build_lineage_visual_html(lineage: dict, filter_label: str = None,
     edges.update(edges.get().map(function (e) {{
       return {{
         id: e.id,
-        color: {{ color: "#888888", opacity: 1 }},
-        width: 1,
+        color: {{ color: originalEdgeColors[e.id] || "#888888", opacity: 1 }},
+        width: e.isFlowBreak ? 2 : 1,
+        dashes: originalEdgeDashes[e.id],
         font: {{ color: FULL_FONT_COLOR, strokeWidth: 3, strokeColor: "#111111", size: 13 }},
       }};
     }}));
@@ -1300,6 +1411,12 @@ def build_lineage_visual_html(lineage: dict, filter_label: str = None,
     }} else if (edge.method === 'value' && (edge.cellA || edge.cellB)) {{
       var row = document.createElement('div');
       row.className = 'match-row';
+      if (edge.isFlowBreak) {{
+        var badge = document.createElement('div');
+        badge.className = 'flow-break-badge';
+        badge.textContent = '\u26a0 Flow break -- no formula ties these sheets together';
+        row.appendChild(badge);
+      }}
       if (edge.evidenceDetail) {{
         var text = document.createElement('div');
         text.className = 'match-text';
@@ -1313,6 +1430,12 @@ def build_lineage_visual_html(lineage: dict, filter_label: str = None,
       row.appendChild(btnRow);
       li.appendChild(row);
     }} else if (edge.evidenceDetail) {{
+      if (edge.isFlowBreak) {{
+        var badge2 = document.createElement('div');
+        badge2.className = 'flow-break-badge';
+        badge2.textContent = '\u26a0 Flow break -- no formula ties these sheets together';
+        li.appendChild(badge2);
+      }}
       var evidence = document.createElement('span');
       evidence.className = 'evidence-detail';
       evidence.textContent = edge.evidenceDetail;
@@ -1614,6 +1737,7 @@ def run_app():
         with st.spinner(f"Running fallback matching on {len(unmapped)} unreached sheet(s)..."):
             fallback_edges = _cached_fallback_match(tuple(unmapped), tuple(sorted(visited)), raw_sheets)
         lineage = classify_and_assemble(root_sheet, traced_edges, fallback_edges, final_output_desc, line_schedule_pattern)
+        lineage = apply_flow_break_detection(lineage, formulas, defined_name_map, sheetnames)
         st.session_state["fld_lineage"] = lineage
 
         excluded = [s for s in unmapped if s not in fallback_edges]
@@ -1684,6 +1808,34 @@ def run_app():
                 file_name="fuzzy_matched_lineage.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+
+        st.divider()
+        st.subheader("4c. Flow breakages")
+        st.caption(
+            "A value-overlap connection where NO formula anywhere in the workbook -- not just on "
+            "the traced path to the filing output -- ties the two sheets together. The number "
+            "lines up, but nothing would recompute it if the source changed; usually means it was "
+            "copy-pasted or manually re-typed rather than linked. These are also the red dashed "
+            "edges in the diagram below."
+        )
+        flow_break_count = lineage.get("flow_break_count", 0)
+        if flow_break_count == 0:
+            st.caption(
+                "No flow breaks detected -- every value-overlap connection in this lineage still "
+                "has a formula tying the two sheets together somewhere in the workbook."
+            )
+        else:
+            st.warning(f"{flow_break_count} flow break(s) detected.")
+            flow_break_rows = [
+                {
+                    "Source Sheet": r["source"], "Source Cell": r.get("cell_a"),
+                    "Target Sheet": r["target"], "Target Cell": r.get("cell_b"),
+                    "Match Score (%)": r.get("match_score"),
+                    "Evidence": r.get("evidence_detail"),
+                }
+                for r in lineage["relationships"] if r.get("is_flow_break")
+            ]
+            st.dataframe(pd.DataFrame(flow_break_rows), use_container_width=True, hide_index=True)
 
         st.divider()
         st.subheader("5. Outputs")
