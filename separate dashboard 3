@@ -565,25 +565,29 @@ def fallback_match_unreached_sheets(unmapped_sheets, lineage_sheets, raw_sheets)
 # FLOW BREAK DETECTION
 # ---------------------------------------------------------------------------
 # A "flow break" is a value-tier connection (two sheets share a raw number)
-# with no formula anywhere tying those two sheets together -- i.e. the
-# number looks copy-pasted or manually re-typed rather than linked, so it
-# won't recompute if the source changes.
+# with no CELL REFERENCE anywhere tying those two sheets together -- e.g.
+# no ='Sheet2'!A1-style formula linking them, in either direction. This is
+# deliberately narrower than "no link of any kind": a workbook-defined name
+# (named range) resolving into the other sheet is a real connection too,
+# but it is not a cell reference, so it does NOT exempt a value-overlap
+# match from being flagged here -- only an actual direct/range cell
+# reference does.
 #
-# trace_lineage_from_root only proves the ABSENCE of a formula path back to
-# the filing root -- it never inspects formulas belonging to a sheet that
-# isn't itself already on the traced (visited) side, since the BFS only
-# reads formulas_by_sheet[current] for sheets already in the frontier. So
-# an unmapped sheet could still have a real formula referencing the exact
-# sheet it was value-matched against, just in a direction/component the
-# root-ward BFS never walks (e.g. the unmapped sheet formula-references its
-# match target, but nothing further up the chain ever formula-feeds root).
-# That's still a real formula link between those two sheets, and shouldn't
-# be flagged as a break. build_direct_formula_pairs scans every formula in
-# the workbook (not just the ones the root-ward trace visited) so that
-# check is a genuine "is there a formula ANYWHERE tying these two sheets
-# together", matching what "flow break" is supposed to mean.
+# trace_lineage_from_root only proves the ABSENCE of a cell-reference path
+# back to the filing root -- it never inspects formulas belonging to a
+# sheet that isn't itself already on the traced (visited) side, since the
+# BFS only reads formulas_by_sheet[current] for sheets already in the
+# frontier. So an unmapped sheet could still have a real cell reference to
+# the exact sheet it was value-matched against, just in a direction/
+# component the root-ward BFS never walks (e.g. the unmapped sheet
+# references its match target, but nothing further up the chain ever
+# feeds root by formula). That's still a real cell-level link between
+# those two sheets, and shouldn't be flagged as a break.
+# build_direct_formula_pairs scans every formula in the workbook (not just
+# the ones the root-ward trace visited) so that check is a genuine "is
+# there a cell reference ANYWHERE tying these two sheets together".
 
-def build_direct_formula_pairs(formulas, defined_name_map, sheetnames=None):
+def build_direct_formula_pairs(formulas, sheetnames=None):
     sheet_lookup = build_sheet_name_lookup(sheetnames) if sheetnames else None
     pairs = set()
     formulas_by_sheet = {}
@@ -592,14 +596,16 @@ def build_direct_formula_pairs(formulas, defined_name_map, sheetnames=None):
 
     for sheet, sheet_formulas in formulas_by_sheet.items():
         for f in sheet_formulas:
+            # Cell/range references only (CELL_REF_RE / COLUMN_ONLY_RE /
+            # ROW_ONLY_RE via extract_cross_sheet_refs) -- named-range
+            # references are intentionally NOT included here, see above.
             direct_refs = extract_cross_sheet_refs(f, sheet, sheet_lookup)
-            named_refs = extract_named_range_refs(f, defined_name_map, sheet, sheet_lookup)
-            for ref in direct_refs | named_refs:
+            for ref in direct_refs:
                 pairs.add(frozenset({sheet, ref}))
     return pairs
 
 
-def apply_flow_break_detection(lineage, formulas, defined_name_map, sheetnames=None):
+def apply_flow_break_detection(lineage, formulas, sheetnames=None):
     """
     Marks every value-tier relationship in `lineage` with is_flow_break
     (True/False) and sets lineage["flow_break_count"]. Mutates and returns
@@ -608,7 +614,7 @@ def apply_flow_break_detection(lineage, formulas, defined_name_map, sheetnames=N
     results, so downstream/filtered views automatically carry the flag too
     without needing their own pass.
     """
-    direct_formula_pairs = build_direct_formula_pairs(formulas, defined_name_map, sheetnames)
+    direct_formula_pairs = build_direct_formula_pairs(formulas, sheetnames)
     flow_breaks = []
     for r in lineage["relationships"]:
         if r.get("method") != "value":
@@ -1016,7 +1022,7 @@ def _edge_label_and_title(r: dict) -> tuple:
         if r.get("is_flow_break"):
             label = "\u26a0 " + label
             title = (
-                f"FLOW BREAK: {src} and {dst} share a value, but no formula anywhere in this "
+                f"FLOW BREAK: {src} and {dst} share a value, but no cell reference anywhere in this "
                 f"workbook ties the two sheets together -- looks copy-pasted or manually re-typed "
                 f"rather than linked. {detail}"
             )
@@ -1088,11 +1094,12 @@ def build_lineage_visual_html(lineage: dict, filter_label: str = None,
             entry["topMatches"] = r.get("top_matches") or []
         if is_flow_break:
             any_flow_breaks = True
-            # Distinct styling so a broken (copy-pasted, no formula anywhere)
-            # link is visually obvious at a glance, not just in the hover
-            # text -- red + dashed, vs. the default solid gray every other
-            # edge (formula, named range, description, or a "clean" value
-            # match that does have a formula elsewhere tying it) still uses.
+            # Distinct styling so a broken (copy-pasted, no cell reference
+            # anywhere) link is visually obvious at a glance, not just in the
+            # hover text -- red + dashed, vs. the default solid gray every
+            # other edge (formula, named range, description, or a "clean"
+            # value match that does have a cell reference elsewhere tying
+            # it) still uses.
             entry["color"] = {"color": "#e74c3c", "highlight": "#ff6b6b", "hover": "#ff6b6b"}
             entry["dashes"] = [6, 4]
             entry["width"] = 2
@@ -1119,8 +1126,8 @@ def build_lineage_visual_html(lineage: dict, filter_label: str = None,
         )
     if any_flow_breaks:
         legend_extra += (
-            "<b style=\"color:#ff6b6b\">Red dashed</b> = flow break: a shared value with no formula "
-            "anywhere in the workbook tying the two sheets together -- looks copy-pasted rather than linked.<br>"
+            "<b style=\"color:#ff6b6b\">Red dashed</b> = flow break: a shared value with no cell "
+            "reference anywhere in the workbook tying the two sheets together -- looks copy-pasted rather than linked.<br>"
         )
 
     return f"""<!doctype html>
@@ -1414,7 +1421,7 @@ def build_lineage_visual_html(lineage: dict, filter_label: str = None,
       if (edge.isFlowBreak) {{
         var badge = document.createElement('div');
         badge.className = 'flow-break-badge';
-        badge.textContent = '\u26a0 Flow break -- no formula ties these sheets together';
+        badge.textContent = '\u26a0 Flow break -- no cell reference ties these sheets together';
         row.appendChild(badge);
       }}
       if (edge.evidenceDetail) {{
@@ -1433,7 +1440,7 @@ def build_lineage_visual_html(lineage: dict, filter_label: str = None,
       if (edge.isFlowBreak) {{
         var badge2 = document.createElement('div');
         badge2.className = 'flow-break-badge';
-        badge2.textContent = '\u26a0 Flow break -- no formula ties these sheets together';
+        badge2.textContent = '\u26a0 Flow break -- no cell reference ties these sheets together';
         li.appendChild(badge2);
       }}
       var evidence = document.createElement('span');
@@ -1737,7 +1744,7 @@ def run_app():
         with st.spinner(f"Running fallback matching on {len(unmapped)} unreached sheet(s)..."):
             fallback_edges = _cached_fallback_match(tuple(unmapped), tuple(sorted(visited)), raw_sheets)
         lineage = classify_and_assemble(root_sheet, traced_edges, fallback_edges, final_output_desc, line_schedule_pattern)
-        lineage = apply_flow_break_detection(lineage, formulas, defined_name_map, sheetnames)
+        lineage = apply_flow_break_detection(lineage, formulas, sheetnames)
         st.session_state["fld_lineage"] = lineage
 
         excluded = [s for s in unmapped if s not in fallback_edges]
@@ -1812,9 +1819,10 @@ def run_app():
         st.divider()
         st.subheader("4c. Flow breakages")
         st.caption(
-            "A value-overlap connection where NO formula anywhere in the workbook -- not just on "
-            "the traced path to the filing output -- ties the two sheets together. The number "
-            "lines up, but nothing would recompute it if the source changed; usually means it was "
+            "A value-overlap connection where NO cell reference anywhere in the workbook -- not "
+            "just on the traced path to the filing output -- ties the two sheets together (a "
+            "named-range-only link does not count as a cell reference here). The number lines up, "
+            "but nothing would recompute it if the source changed; usually means it was "
             "copy-pasted or manually re-typed rather than linked. These are also the red dashed "
             "edges in the diagram below."
         )
